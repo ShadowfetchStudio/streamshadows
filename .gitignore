@@ -1,0 +1,16 @@
+# SwiftPM & Xcode
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# Built app bundles
+dist/
+*.app/
+*.dmg
+
+# macOS
+.DS_Store
+*.swp
+*~

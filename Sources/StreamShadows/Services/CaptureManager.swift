@@ -1,0 +1,294 @@
+import Foundation
+import ScreenCaptureKit
+@preconcurrency import AVFoundation
+import CoreMedia
+import CoreVideo
+import CoreGraphics
+
+/// Coordinates macOS ScreenCaptureKit (display video + system audio) and AVFoundation (camera + microphone).
+public final class CaptureManager: NSObject, @unchecked Sendable {
+    private var scStream: SCStream?
+    private var availableDisplays: [SCDisplay] = []
+
+    private var cameraSession: AVCaptureSession?
+    private var micSession: AVCaptureSession?
+
+    private let screenVideoQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.screen.video", qos: .userInteractive)
+    private let screenAudioQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.screen.audio", qos: .userInteractive)
+    private let cameraQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.camera.video", qos: .userInteractive)
+    private let micQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.mic.audio", qos: .userInteractive)
+
+    public var onScreenVideoFrame: (@Sendable (CVPixelBuffer) -> Void)?
+    public var onScreenAudioBuffer: (@Sendable (CMSampleBuffer) -> Void)?
+    public var onCameraVideoFrame: (@Sendable (CVPixelBuffer) -> Void)?
+    public var onMicAudioBuffer: (@Sendable (CMSampleBuffer) -> Void)?
+    public var onCaptureError: (@Sendable (String) -> Void)?
+
+    // MARK: - Permissions
+
+    public static func hasScreenCapturePermission() -> Bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
+    @discardableResult
+    public static func requestScreenCapturePermission() -> Bool {
+        CGRequestScreenCaptureAccess()
+    }
+
+    public static func cameraAuthorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .video)
+    }
+
+    public static func microphoneAuthorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
+    public static func requestCameraAccess() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .video)
+    }
+
+    public static func requestMicrophoneAccess() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .audio)
+    }
+
+    // MARK: - Device Discovery
+
+    public func refreshDisplays() async throws -> [DisplayOption] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        self.availableDisplays = content.displays
+
+        return content.displays.enumerated().map { idx, display in
+            let isMain = CGDisplayIsMain(display.displayID) != 0
+            let name = isMain ? "Main Display (\(idx + 1))" : "Display \(idx + 1)"
+            return DisplayOption(
+                id: display.displayID,
+                name: name,
+                width: display.width,
+                height: display.height
+            )
+        }
+    }
+
+    public func listCameras() -> [CaptureDeviceOption] {
+        let deviceTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .external,
+            .continuityCamera
+        ]
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .video,
+            position: .unspecified
+        )
+        return session.devices.map {
+            CaptureDeviceOption(id: $0.uniqueID, name: $0.localizedName)
+        }
+    }
+
+    public func listMicrophones() -> [CaptureDeviceOption] {
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        return session.devices.map {
+            CaptureDeviceOption(id: $0.uniqueID, name: $0.localizedName)
+        }
+    }
+
+    // MARK: - Screen Capture
+
+    public func startScreenCapture(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, captureSystemAudio: Bool) async throws {
+        await stopScreenCapture()
+
+        if availableDisplays.isEmpty {
+            _ = try await refreshDisplays()
+        }
+
+        guard let targetDisplay = availableDisplays.first(where: { $0.displayID == displayID }) ?? availableDisplays.first else {
+            throw NSError(domain: "StreamShadows", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "No display available to capture. Grant Screen Recording permission in System Settings."
+            ])
+        }
+
+        let filter = SCContentFilter(display: targetDisplay, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.width = width
+        config.height = height
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = true
+        config.queueDepth = 5
+        config.capturesAudio = captureSystemAudio
+        config.sampleRate = 48_000
+        config.channelCount = 2
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenVideoQueue)
+        if captureSystemAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: screenAudioQueue)
+        }
+
+        try await stream.startCapture()
+        self.scStream = stream
+    }
+
+    public func stopScreenCapture() async {
+        if let stream = scStream {
+            scStream = nil
+            try? await stream.stopCapture()
+        }
+    }
+
+    // MARK: - Camera Capture
+
+    public func startCameraCapture(deviceID: String) throws {
+        stopCameraCapture()
+
+        guard let device = AVCaptureDevice(uniqueID: deviceID) else {
+            throw NSError(domain: "StreamShadows", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Selected camera is no longer available."
+            ])
+        }
+
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        }
+
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+            throw NSError(domain: "StreamShadows", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Could not attach camera input."
+            ])
+        }
+        session.addInput(input)
+
+        let output = AVCaptureVideoDataOutput()
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        output.alwaysDiscardsLateVideoFrames = true
+        output.setSampleBufferDelegate(self, queue: cameraQueue)
+
+        guard session.canAddOutput(output) else {
+            throw NSError(domain: "StreamShadows", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "Could not attach camera video output."
+            ])
+        }
+        session.addOutput(output)
+        session.commitConfiguration()
+
+        self.cameraSession = session
+        cameraQueue.async {
+            session.startRunning()
+        }
+    }
+
+    public func stopCameraCapture() {
+        if let session = cameraSession {
+            cameraSession = nil
+            cameraQueue.async {
+                if session.isRunning {
+                    session.stopRunning()
+                }
+            }
+        }
+    }
+
+    // MARK: - Microphone Capture
+
+    public func startMicrophoneCapture(deviceID: String) throws {
+        stopMicrophoneCapture()
+
+        guard let device = AVCaptureDevice(uniqueID: deviceID) else {
+            throw NSError(domain: "StreamShadows", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "Selected microphone is no longer available."
+            ])
+        }
+
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+            throw NSError(domain: "StreamShadows", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "Could not attach microphone input."
+            ])
+        }
+        session.addInput(input)
+
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: micQueue)
+
+        guard session.canAddOutput(output) else {
+            throw NSError(domain: "StreamShadows", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "Could not attach microphone audio output."
+            ])
+        }
+        session.addOutput(output)
+        session.commitConfiguration()
+
+        self.micSession = session
+        micQueue.async {
+            session.startRunning()
+        }
+    }
+
+    public func stopMicrophoneCapture() {
+        if let session = micSession {
+            micSession = nil
+            micQueue.async {
+                if session.isRunning {
+                    session.stopRunning()
+                }
+            }
+        }
+    }
+
+    public func stopAll() async {
+        await stopScreenCapture()
+        stopCameraCapture()
+        stopMicrophoneCapture()
+    }
+}
+
+// MARK: - SCStreamOutput & SCStreamDelegate
+
+extension CaptureManager: SCStreamOutput, SCStreamDelegate {
+    public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard CMSampleBufferIsValid(sampleBuffer) else { return }
+        switch type {
+        case .screen:
+            if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                onScreenVideoFrame?(pixelBuffer)
+            }
+        case .audio:
+            onScreenAudioBuffer?(sampleBuffer)
+        case .microphone:
+            onMicAudioBuffer?(sampleBuffer)
+        @unknown default:
+            break
+        }
+    }
+
+    public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        onCaptureError?("Screen capture stopped: \(error.localizedDescription)")
+    }
+}
+
+// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate & AVCaptureAudioDataOutputSampleBufferDelegate
+
+extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+    public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard CMSampleBufferIsValid(sampleBuffer) else { return }
+        if output is AVCaptureVideoDataOutput {
+            if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                onCameraVideoFrame?(pixelBuffer)
+            }
+        } else if output is AVCaptureAudioDataOutput {
+            onMicAudioBuffer?(sampleBuffer)
+        }
+    }
+}
