@@ -17,6 +17,9 @@ struct ContentView: View {
                     if case .error(let message) = viewModel.streamState {
                         bannerView(message, isError: true)
                     }
+                    if case .error(let message) = viewModel.recordingState {
+                        bannerView(message, isError: true)
+                    }
 
                     previewStage
                     AudioMixerPanel(viewModel: viewModel)
@@ -50,6 +53,20 @@ struct ContentView: View {
             }
 
             statusPill
+
+            if viewModel.recordingState.isRecording {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 8, height: 8)
+                    Text("REC \(viewModel.recordingElapsedText)")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.red.opacity(0.18)))
+                .foregroundStyle(.red)
+            }
 
             if viewModel.streamState.isLive {
                 HStack(spacing: 10) {
@@ -85,6 +102,24 @@ struct ContentView: View {
             }
 
             Button {
+                viewModel.toggleRecording()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: viewModel.recordingState.isActive ? "stop.circle.fill" : "record.circle")
+                    Text(recordButtonTitle)
+                        .fontWeight(.semibold)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+            }
+            .buttonStyle(.bordered)
+            .tint(viewModel.recordingState.isActive ? .red : .secondary)
+            .disabled(!viewModel.recordingState.isActive && !viewModel.canStartRecording)
+            .help(viewModel.recordingState.isActive
+                  ? "Stop local recording"
+                  : "Record your screen/camera locally to disk (works standalone or while live)")
+
+            Button {
                 viewModel.toggleStream()
             } label: {
                 HStack(spacing: 6) {
@@ -105,6 +140,14 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var recordButtonTitle: String {
+        switch viewModel.recordingState {
+        case .idle, .error: return "Record"
+        case .recording: return "Stop Rec"
+        case .stopping: return "Saving…"
+        }
     }
 
     private var streamButtonTitle: String {

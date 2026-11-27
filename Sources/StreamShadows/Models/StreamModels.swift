@@ -291,3 +291,42 @@ public enum StreamState: Equatable, Sendable {
         }
     }
 }
+
+public enum RecordingFormat: String, CaseIterable, Identifiable, Codable, Sendable {
+    case mp4 = "mp4"
+    case mkv = "mkv"
+    case mov = "mov"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .mp4: return "MP4 (H.264 / AAC)"
+        case .mkv: return "MKV (Matroska)"
+        case .mov: return "MOV (QuickTime)"
+        }
+    }
+
+    public var fileExtension: String { rawValue }
+}
+
+public enum RecordingState: Equatable, Sendable {
+    case idle
+    case recording(startedAt: Date, fileURL: URL)
+    case stopping
+    case error(String)
+
+    public var isRecording: Bool {
+        if case .recording = self { return true }
+        return false
+    }
+
+    public var isActive: Bool {
+        switch self {
+        case .recording, .stopping:
+            return true
+        case .idle, .error:
+            return false
+        }
+    }
+}

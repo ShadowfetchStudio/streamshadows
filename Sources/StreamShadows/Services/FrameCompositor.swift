@@ -16,11 +16,13 @@ public struct CompositorConfig: Sendable {
     public init() {}
 }
 
-/// Reusable raw byte buffer to avoid 8.3 MB per-frame heap allocations at 1080p60.
+/// Reusable raw byte buffer with thread-safe retain/release so streaming and local recording can share frames zero-copy.
 public final class PooledFrameBuffer: @unchecked Sendable {
     public let pointer: UnsafeMutableRawPointer
     public let byteCount: Int
     private weak var pool: FrameBufferPool?
+    private let refLock = NSLock()
+    private var refCount: Int = 1
 
     init(byteCount: Int, pool: FrameBufferPool) {
         self.byteCount = byteCount
@@ -28,8 +30,29 @@ public final class PooledFrameBuffer: @unchecked Sendable {
         self.pool = pool
     }
 
+    func resetRefCount() {
+        refLock.lock()
+        refCount = 1
+        refLock.unlock()
+    }
+
+    /// Retains an additional consumer reference (e.g. simultaneous streaming + recording).
+    public func retain() {
+        refLock.lock()
+        refCount += 1
+        refLock.unlock()
+    }
+
+    /// Releases a consumer reference; recycles back to the pool once all consumers are done.
     public func recycle() {
-        pool?.release(self)
+        refLock.lock()
+        refCount -= 1
+        let shouldRecycle = refCount <= 0
+        refLock.unlock()
+
+        if shouldRecycle {
+            pool?.release(self)
+        }
     }
 
     deinit {
@@ -44,7 +67,7 @@ public final class FrameBufferPool: @unchecked Sendable {
     private var currentByteCount: Int = 0
     private let maxPoolSize: Int
 
-    public init(maxPoolSize: Int = 4) {
+    public init(maxPoolSize: Int = 6) {
         self.maxPoolSize = max(2, maxPoolSize)
     }
 
@@ -56,6 +79,7 @@ public final class FrameBufferPool: @unchecked Sendable {
         }
         if let reused = available.popLast() {
             lock.unlock()
+            reused.resetRefCount()
             return reused
         }
         lock.unlock()

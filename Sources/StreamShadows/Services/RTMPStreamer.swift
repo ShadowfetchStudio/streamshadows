@@ -32,7 +32,7 @@ public final class RTMPStreamer: @unchecked Sendable {
 
     private var videoFD: Int32 = -1
     private var audioFD: Int32 = -1
-    private var isStopping = false
+    private var isStopping = true
     private var secretsToRedact: [String] = []
 
     private var pendingVideoFrames: Int = 0

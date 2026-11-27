@@ -128,6 +128,17 @@ public final class StreamViewModel: ObservableObject {
 
     @Published public var detectedFFmpegPath: String?
 
+    // MARK: - Recording Settings & State
+    @Published public var recordingFormat: RecordingFormat = .mp4 {
+        didSet { savePreferences() }
+    }
+    @Published public var recordingDirectoryPath: String = LocalRecorder.defaultRecordingsDirectory().path {
+        didSet { savePreferences() }
+    }
+    @Published public var recordingState: RecordingState = .idle
+    @Published public var recordingElapsedText: String = "00:00:00"
+    @Published public var lastRecordingURL: URL?
+
     // MARK: - Live State
     @Published public var streamState: StreamState = .idle
     @Published public var previewImage: CGImage?
@@ -141,11 +152,13 @@ public final class StreamViewModel: ObservableObject {
     private let compositor = FrameCompositor()
     private let audioMixer = AudioMixer()
     private let streamer = RTMPStreamer()
+    private let recorder = LocalRecorder()
     private let keychain = KeychainStore()
     private let sleepPreventer = SleepPreventer()
     private let defaults = UserDefaults.standard
 
     private var uptimeTimer: Timer?
+    private var recordingTimer: Timer?
     private var isBootstrapped = false
     private var isRequestingMicPermission = false
     private var hasAutoPromptedMic = false
@@ -168,6 +181,18 @@ public final class StreamViewModel: ObservableObject {
 
     public var canStartStream: Bool {
         !streamState.isActive && !readyDestinations.isEmpty && detectedFFmpegPath != nil
+    }
+
+    public var canStartRecording: Bool {
+        !recordingState.isActive && detectedFFmpegPath != nil
+    }
+
+    public var isEncodingActive: Bool {
+        streamState.isActive || recordingState.isActive
+    }
+
+    private var isPipelineProducingFrames: Bool {
+        streamState == .starting || streamState.isLive || recordingState.isRecording
     }
 
     // MARK: - Lifecycle
@@ -246,8 +271,11 @@ public final class StreamViewModel: ObservableObject {
         notificationObservers.removeAll()
         uptimeTimer?.invalidate()
         uptimeTimer = nil
+        recordingTimer?.invalidate()
+        recordingTimer = nil
         sleepPreventer.endPreventingSleep()
         streamer.stop()
+        recorder.stop()
         compositor.stop()
         audioMixer.stop()
         Task {
@@ -524,12 +552,12 @@ public final class StreamViewModel: ObservableObject {
                 encoder: encoderPreference,
                 customFFmpegPath: customFFmpegPath
             )
-            sleepPreventer.beginPreventingSleep()
+            updateSleepAssertion()
             updateCompositorConfig()
             pushAudioMixerSettings()
         } catch {
-            sleepPreventer.endPreventingSleep()
             streamState = .error(error.localizedDescription)
+            updateSleepAssertion()
             updateCompositorConfig()
             pushAudioMixerSettings()
             appendLog("Start failed: \(error.localizedDescription)")
@@ -541,11 +569,99 @@ public final class StreamViewModel: ObservableObject {
         streamState = .stopping
         uptimeTimer?.invalidate()
         uptimeTimer = nil
-        sleepPreventer.endPreventingSleep()
+        updateSleepAssertion()
         updateCompositorConfig()
         pushAudioMixerSettings()
         streamer.stop()
         appendLog("Stopping stream…")
+    }
+
+    // MARK: - Recording Control
+
+    public func toggleRecording() {
+        if recordingState.isActive {
+            stopRecording()
+        } else {
+            startRecording()
+        }
+    }
+
+    public func startRecording() {
+        guard !recordingState.isActive else { return }
+
+        guard detectedFFmpegPath != nil else {
+            recordingState = .error(LocalRecorderError.ffmpegNotFound.localizedDescription)
+            return
+        }
+
+        recordingElapsedText = "00:00:00"
+        let folderURL = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+
+        do {
+            let fileURL = try recorder.start(
+                directory: folderURL,
+                format: recordingFormat,
+                preset: qualityPreset,
+                encoder: encoderPreference,
+                customFFmpegPath: customFFmpegPath
+            )
+            let startedAt = Date()
+            recordingState = .recording(startedAt: startedAt, fileURL: fileURL)
+            startRecordingTimer(from: startedAt)
+            updateSleepAssertion()
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+        } catch {
+            recordingState = .error(error.localizedDescription)
+            updateSleepAssertion()
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+            appendLog("Recording failed to start: \(error.localizedDescription)")
+        }
+    }
+
+    public func stopRecording() {
+        guard recordingState.isActive else { return }
+        recordingState = .stopping
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        updateSleepAssertion()
+        updateCompositorConfig()
+        pushAudioMixerSettings()
+        recorder.stop()
+        appendLog("Finalizing recording…")
+    }
+
+    public func chooseRecordingFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+        panel.prompt = "Choose Folder"
+        if panel.runModal() == .OK, let url = panel.url {
+            recordingDirectoryPath = url.path
+        }
+    }
+
+    public func openRecordingsFolder() {
+        let url = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+    }
+
+    public func revealLastRecordingInFinder() {
+        guard let url = lastRecordingURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func updateSleepAssertion() {
+        if streamState.isActive || recordingState.isActive {
+            sleepPreventer.beginPreventingSleep()
+        } else {
+            sleepPreventer.endPreventingSleep()
+        }
     }
 
     public func clearLogs() {
@@ -582,12 +698,16 @@ public final class StreamViewModel: ObservableObject {
                 self?.previewImage = cgImage
             }
         }
-        compositor.onEncodedVideoFrame = { [weak streamer] frameData in
-            streamer?.writeVideoFrame(frameData)
+        compositor.onEncodedVideoFrame = { [weak streamer, weak recorder] frameBuffer in
+            // Share zero-copy frame across both live streamer and local recorder
+            frameBuffer.retain()
+            streamer?.writeVideoFrame(frameBuffer)
+            recorder?.writeVideoFrame(frameBuffer)
         }
 
-        audioMixer.onMixedPCMFrame = { [weak streamer] pcmData in
+        audioMixer.onMixedPCMFrame = { [weak streamer, weak recorder] pcmData in
             streamer?.writeAudioFrame(pcmData)
+            recorder?.writeAudioFrame(pcmData)
         }
         audioMixer.onLevelsUpdated = { [weak self] levels in
             Task { @MainActor in
@@ -618,7 +738,6 @@ public final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.uptimeTimer?.invalidate()
                 self.uptimeTimer = nil
-                self.sleepPreventer.endPreventingSleep()
                 if let errorMessage {
                     self.streamState = .error(errorMessage)
                     self.appendLog(errorMessage)
@@ -626,6 +745,35 @@ public final class StreamViewModel: ObservableObject {
                     self.streamState = .idle
                     self.appendLog("Stream stopped cleanly (exit \(code)).")
                 }
+                self.updateSleepAssertion()
+                self.updateCompositorConfig()
+                self.pushAudioMixerSettings()
+            }
+        }
+
+        recorder.onLogLine = { [weak self] line in
+            Task { @MainActor in
+                self?.appendLog(line)
+            }
+        }
+        recorder.onFinished = { [weak self] savedURL, code, errorMessage in
+            Task { @MainActor in
+                guard let self else { return }
+                self.recordingTimer?.invalidate()
+                self.recordingTimer = nil
+                if let errorMessage {
+                    self.recordingState = .error(errorMessage)
+                    self.appendLog(errorMessage)
+                } else {
+                    self.recordingState = .idle
+                    if let savedURL, FileManager.default.fileExists(atPath: savedURL.path) {
+                        self.lastRecordingURL = savedURL
+                        self.appendLog("Recording saved: \(savedURL.lastPathComponent)")
+                    } else {
+                        self.appendLog("Recording stopped (exit \(code)).")
+                    }
+                }
+                self.updateSleepAssertion()
                 self.updateCompositorConfig()
                 self.pushAudioMixerSettings()
             }
@@ -641,7 +789,7 @@ public final class StreamViewModel: ObservableObject {
         cfg.width = qualityPreset.width
         cfg.height = qualityPreset.height
         cfg.fps = qualityPreset.fps
-        cfg.isStreaming = (streamState == .starting || streamState.isLive)
+        cfg.isStreaming = isPipelineProducingFrames
         compositor.updateConfig(cfg)
     }
 
@@ -655,8 +803,22 @@ public final class StreamViewModel: ObservableObject {
         s.micAudioVolume = micAudioVolume
         s.masterMuted = masterMuted
         s.masterVolume = masterVolume
-        s.isStreaming = (streamState == .starting || streamState.isLive)
+        s.isStreaming = isPipelineProducingFrames
         audioMixer.updateSettings(s)
+    }
+
+    private func startRecordingTimer(from startDate: Date) {
+        recordingTimer?.invalidate()
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let elapsed = max(0, Int(Date().timeIntervalSince(startDate)))
+                let hrs = elapsed / 3600
+                let mins = (elapsed % 3600) / 60
+                let secs = elapsed % 60
+                self.recordingElapsedText = String(format: "%02d:%02d:%02d", hrs, mins, secs)
+            }
+        }
     }
 
     private func startUptimeTimer(from startDate: Date) {
@@ -727,6 +889,12 @@ public final class StreamViewModel: ObservableObject {
             encoderPreference = enc
         }
         customFFmpegPath = defaults.string(forKey: "customFFmpegPath") ?? ""
+        if let raw = defaults.string(forKey: "recordingFormat"), let fmt = RecordingFormat(rawValue: raw) {
+            recordingFormat = fmt
+        }
+        if let savedDir = defaults.string(forKey: "recordingDirectoryPath"), !savedDir.isEmpty {
+            recordingDirectoryPath = savedDir
+        }
 
         destinations = StreamingPlatform.allCases.map { platform in
             let enabled = defaults.bool(forKey: "dest_enabled_\(platform.rawValue)")
@@ -755,6 +923,8 @@ public final class StreamViewModel: ObservableObject {
         defaults.set(qualityPreset.rawValue, forKey: "qualityPreset")
         defaults.set(encoderPreference.rawValue, forKey: "encoderPreference")
         defaults.set(customFFmpegPath, forKey: "customFFmpegPath")
+        defaults.set(recordingFormat.rawValue, forKey: "recordingFormat")
+        defaults.set(recordingDirectoryPath, forKey: "recordingDirectoryPath")
 
         for dest in destinations {
             defaults.set(dest.isEnabled, forKey: "dest_enabled_\(dest.platform.rawValue)")

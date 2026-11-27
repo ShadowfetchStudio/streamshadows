@@ -21,6 +21,10 @@ Stream your desktop, your camera, or both (with Picture-in-Picture) to **YouTube
   - Built-in presets for **YouTube**, **Twitch**, and **X (Twitter)** with editable `rtmp://` / `rtmps://` ingest URLs, inline URL validation, and simultaneous multi-streaming (`tee` muxer with target escaping).
   - Stream keys are stored securely in the **macOS Keychain** (with debounced writes) and automatically redacted from logs.
   - Bounded backpressure frame dropping with live dropped-frame telemetry, handshake-confirmed `LIVE` status, and automatic macOS display sleep prevention (`IOPMAssertion`) while broadcasting.
+- **Local Recording (MP4, MKV, MOV)**:
+  - Record your screen, camera, or Screen + Cam PiP locally to disk with one click (**Record / Stop Rec**) — either standalone without streaming or simultaneously while live.
+  - Uses crash-safe fragmented MP4/MOV (`+frag_keyframe+empty_moov+default_base_moof`) and clean FIFO EOF finalization so recordings are immediately playable and never corrupted.
+  - Configurable output folder (default `~/Movies/StreamShadows`) with quick **Open Folder** and **Reveal Last** buttons.
 - **Hardware-Accelerated Encoding**:
   - Uses Apple VideoToolbox (`h264_videotoolbox`) via `ffmpeg` with software `libx264` fallback and selectable 720p/1080p 30/60 fps presets.
 
@@ -73,6 +77,7 @@ On first launch, macOS will ask for:
 - `Sources/StreamShadows/Services/FrameCompositor.swift` — Metal-backed `CoreImage` compositor with `FrameBufferPool` and wall-clock pacing.
 - `Sources/StreamShadows/Services/AudioMixer.swift` — 48 kHz stereo mixer with `FloatRingBuffer`, 16/24/32-bit PCM decoding, resampling, soft clipping, and drift protection.
 - `Sources/StreamShadows/Services/RTMPStreamer.swift` — `ffmpeg` process manager with non-blocking FIFO opening, bounded backpressure, secret redaction, and `tee` multi-streaming.
+- `Sources/StreamShadows/Services/LocalRecorder.swift` — Standalone and simultaneous local MP4/MKV/MOV recorder with crash-safe container flags and graceful EOF finalization.
 - `Sources/StreamShadows/Services/KeychainStore.swift` — macOS Keychain persistence for stream keys.
 - `Sources/StreamShadows/Services/SleepPreventer.swift` — IOKit `IOPMAssertion` wrapper to prevent display sleep while live.
 - `Sources/StreamShadows/ViewModels/StreamViewModel.swift` — `@MainActor` coordinator with debounced Keychain saves and hot-plug device observers.

@@ -168,14 +168,53 @@ final class StreamShadowsTests: XCTestCase {
         let pool = FrameBufferPool(maxPoolSize: 2)
         let buf1 = pool.acquire(byteCount: 1024)
         let ptr1 = buf1.pointer
-        buf1.recycle()
 
+        // Retain a second consumer reference (simultaneous stream + record)
+        buf1.retain()
+        buf1.recycle()
+        // Should NOT be recycled yet while second consumer still holds it
+        let bufOther = pool.acquire(byteCount: 1024)
+        XCTAssertNotEqual(bufOther.pointer, ptr1)
+        bufOther.recycle()
+
+        // Final release returns buf1 to the pool
+        buf1.recycle()
         let buf2 = pool.acquire(byteCount: 1024)
-        XCTAssertEqual(buf2.pointer, ptr1, "Expected pool to reuse recycled buffer of matching size")
+        XCTAssertEqual(buf2.pointer, ptr1, "Expected pool to reuse recycled buffer after all consumers release")
         buf2.recycle()
 
         let buf3 = pool.acquire(byteCount: 2048)
         XCTAssertEqual(buf3.byteCount, 2048)
         buf3.recycle()
+    }
+
+    func testLocalRecorderFFmpegArgumentsAndFilename() {
+        let dir = URL(fileURLWithPath: "/tmp/recordings", isDirectory: true)
+        let mp4URL = LocalRecorder.makeRecordingURL(in: dir, format: .mp4)
+        XCTAssertTrue(mp4URL.lastPathComponent.hasPrefix("StreamShadows_"))
+        XCTAssertEqual(mp4URL.pathExtension, "mp4")
+
+        let mp4Args = LocalRecorder.buildFFmpegArguments(
+            videoPipePath: "/tmp/v.fifo",
+            audioPipePath: "/tmp/a.fifo",
+            preset: .p1080_30,
+            encoder: .hardwareVideoToolbox,
+            format: .mp4,
+            outputPath: mp4URL.path
+        )
+        XCTAssertTrue(mp4Args.contains("h264_videotoolbox"))
+        XCTAssertTrue(mp4Args.contains("+frag_keyframe+empty_moov+default_base_moof"))
+        XCTAssertEqual(mp4Args.last, mp4URL.path)
+
+        let mkvArgs = LocalRecorder.buildFFmpegArguments(
+            videoPipePath: "/tmp/v.fifo",
+            audioPipePath: "/tmp/a.fifo",
+            preset: .p720_30,
+            encoder: .softwareX264,
+            format: .mkv,
+            outputPath: "/tmp/recordings/out.mkv"
+        )
+        XCTAssertTrue(mkvArgs.contains("libx264"))
+        XCTAssertFalse(mkvArgs.contains("-movflags"))
     }
 }

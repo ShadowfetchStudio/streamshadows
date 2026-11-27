@@ -411,7 +411,7 @@ struct InspectorSidebar: View {
                         }
                     }
                     .labelsHidden()
-                    .disabled(viewModel.streamState.isActive)
+                    .disabled(viewModel.isEncodingActive)
 
                     Text("Encoder")
                         .font(.subheadline.weight(.semibold))
@@ -423,7 +423,62 @@ struct InspectorSidebar: View {
                         }
                     }
                     .labelsHidden()
-                    .disabled(viewModel.streamState.isActive)
+                    .disabled(viewModel.isEncodingActive)
+                }
+                .padding(4)
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Local Recording", systemImage: "record.circle")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        if viewModel.recordingState.isRecording {
+                            Text(viewModel.recordingElapsedText)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.red)
+                        }
+                    }
+
+                    Picker("Format", selection: $viewModel.recordingFormat) {
+                        ForEach(RecordingFormat.allCases) { fmt in
+                            Text(fmt.title).tag(fmt)
+                        }
+                    }
+                    .disabled(viewModel.recordingState.isActive)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Save Folder")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(viewModel.recordingDirectoryPath)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Choose…") {
+                            viewModel.chooseRecordingFolder()
+                        }
+                        .controlSize(.small)
+                        .disabled(viewModel.recordingState.isActive)
+
+                        Button("Open Folder") {
+                            viewModel.openRecordingsFolder()
+                        }
+                        .controlSize(.small)
+
+                        if viewModel.lastRecordingURL != nil {
+                            Button("Reveal Last") {
+                                viewModel.revealLastRecordingInFinder()
+                            }
+                            .controlSize(.small)
+                        }
+                    }
                 }
                 .padding(4)
             }
