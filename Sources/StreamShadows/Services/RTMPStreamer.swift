@@ -12,7 +12,7 @@ public enum RTMPStreamerError: LocalizedError, Sendable {
         case .ffmpegNotFound:
             return "FFmpeg was not found. Install FFmpeg (e.g. `brew install ffmpeg`) or set its path in the Output tab."
         case .noValidDestinations:
-            return "Enable at least one streaming platform (YouTube, Twitch, or X) and enter its stream key."
+            return "Enable at least one streaming platform (YouTube, Twitch, or X) with a valid rtmp:// or rtmps:// URL and stream key."
         case .pipeCreationFailed(let msg):
             return "Failed to initialize media pipes: \(msg)"
         case .processFailedToStart(let msg):
@@ -23,6 +23,9 @@ public enum RTMPStreamerError: LocalizedError, Sendable {
 
 /// Manages FFmpeg hardware/software encoding and RTMP(S) output to one or multiple platforms.
 public final class RTMPStreamer: @unchecked Sendable {
+    public static let maxPendingVideoFrames = 2
+    public static let maxPendingAudioFrames = 12
+
     private let lock = NSLock()
     private var process: Process?
     private var tempDirURL: URL?
@@ -31,6 +34,10 @@ public final class RTMPStreamer: @unchecked Sendable {
     private var audioFD: Int32 = -1
     private var isStopping = false
     private var secretsToRedact: [String] = []
+
+    private var pendingVideoFrames: Int = 0
+    private var pendingAudioFrames: Int = 0
+    public private(set) var droppedVideoFrames: Int = 0
 
     private let videoWriteQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.rtmp.video", qos: .userInteractive)
     private let audioWriteQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.rtmp.audio", qos: .userInteractive)
@@ -65,7 +72,6 @@ public final class RTMPStreamer: @unchecked Sendable {
             return path
         }
 
-        // Fallback: search PATH
         if let envPath = ProcessInfo.processInfo.environment["PATH"] {
             for dir in envPath.split(separator: ":") {
                 let candidate = "\(dir)/ffmpeg"
@@ -75,6 +81,22 @@ public final class RTMPStreamer: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// Escapes special characters for FFmpeg's `tee` muxer target syntax.
+    public static func escapeTeeTarget(_ target: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(target.count + 8)
+        for ch in target {
+            switch ch {
+            case "\\", "|", "[", "]", "'":
+                escaped.append("\\")
+                escaped.append(ch)
+            default:
+                escaped.append(ch)
+            }
+        }
+        return escaped
     }
 
     public static func buildFFmpegArguments(
@@ -133,10 +155,9 @@ public final class RTMPStreamer: @unchecked Sendable {
                 onlyURL
             ])
         } else {
-            // Multi-destination tee muxer
             args.append(contentsOf: ["-flags", "+global_header"])
             let teeTargets = destinationURLs
-                .map { "[f=flv:onfail=ignore]\($0)" }
+                .map { "[f=flv:onfail=ignore]\(escapeTeeTarget($0))" }
                 .joined(separator: "|")
             args.append(contentsOf: [
                 "-f", "tee",
@@ -208,6 +229,9 @@ public final class RTMPStreamer: @unchecked Sendable {
         self.tempDirURL = sessionDir
         self.isStopping = false
         self.secretsToRedact = secrets
+        self.pendingVideoFrames = 0
+        self.pendingAudioFrames = 0
+        self.droppedVideoFrames = 0
         lock.unlock()
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -223,6 +247,7 @@ public final class RTMPStreamer: @unchecked Sendable {
             let wasStopping: Bool
             self.lock.lock()
             wasStopping = self.isStopping
+            self.isStopping = true
             self.lock.unlock()
 
             self.cleanupPipesAndTempDir()
@@ -241,63 +266,123 @@ public final class RTMPStreamer: @unchecked Sendable {
 
         onLogLine?("Starting \(encoder.title) stream (\(preset.width)x\(preset.height) @ \(preset.fps)fps) to \(activeDestinations.map(\.platform.displayName).joined(separator: ", "))…")
 
-        // Open both FIFOs concurrently on dedicated queues so neither blocks the other
+        // Open both FIFOs non-blocking with a bounded retry loop so an early ffmpeg crash never deadlocks the queues
         let vPath = videoPipeURL.path
         let aPath = audioPipeURL.path
         videoWriteQueue.async { [weak self] in
-            let fd = Darwin.open(vPath, O_WRONLY)
-            guard let self else {
-                if fd >= 0 { Darwin.close(fd) }
-                return
-            }
-            self.lock.lock()
-            if self.isStopping {
-                self.lock.unlock()
-                if fd >= 0 { Darwin.close(fd) }
-            } else {
-                self.videoFD = fd
-                self.lock.unlock()
-            }
+            self?.openFIFOWithRetry(path: vPath, process: proc, isVideo: true)
         }
-
         audioWriteQueue.async { [weak self] in
-            let fd = Darwin.open(aPath, O_WRONLY)
-            guard let self else {
-                if fd >= 0 { Darwin.close(fd) }
+            self?.openFIFOWithRetry(path: aPath, process: proc, isVideo: false)
+        }
+    }
+
+    private func openFIFOWithRetry(path: String, process: Process, isVideo: Bool) {
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            lock.lock()
+            let stopping = isStopping
+            lock.unlock()
+            if stopping || !process.isRunning {
                 return
             }
-            self.lock.lock()
-            if self.isStopping {
-                self.lock.unlock()
-                if fd >= 0 { Darwin.close(fd) }
+
+            let fd = Darwin.open(path, O_WRONLY | O_NONBLOCK)
+            if fd >= 0 {
+                // Switch to blocking writes once reader has opened the FIFO
+                let flags = fcntl(fd, F_GETFL, 0)
+                if flags >= 0 {
+                    _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+                }
+
+                lock.lock()
+                if isStopping {
+                    lock.unlock()
+                    Darwin.close(fd)
+                } else {
+                    if isVideo {
+                        self.videoFD = fd
+                    } else {
+                        self.audioFD = fd
+                    }
+                    lock.unlock()
+                }
+                return
+            }
+
+            // ENXIO means ffmpeg hasn't opened the read end yet; retry shortly
+            if errno == ENXIO || errno == EINTR {
+                usleep(10_000) // 10ms
+                continue
             } else {
-                self.audioFD = fd
-                self.lock.unlock()
+                return
             }
         }
     }
 
-    public func writeVideoFrame(_ data: Data) {
+    /// Writes a pooled BGRA video frame with backpressure dropping if the FIFO lags.
+    public func writeVideoFrame(_ buffer: PooledFrameBuffer) {
+        lock.lock()
+        let stopping = isStopping
+        if stopping || pendingVideoFrames >= Self.maxPendingVideoFrames {
+            if !stopping {
+                droppedVideoFrames += 1
+            }
+            lock.unlock()
+            buffer.recycle()
+            return
+        }
+        pendingVideoFrames += 1
+        lock.unlock()
+
         videoWriteQueue.async { [weak self] in
+            defer {
+                if let self {
+                    self.lock.lock()
+                    self.pendingVideoFrames = max(0, self.pendingVideoFrames - 1)
+                    self.lock.unlock()
+                }
+                buffer.recycle()
+            }
             guard let self else { return }
             self.lock.lock()
             let fd = self.videoFD
             let stopping = self.isStopping
             self.lock.unlock()
             guard fd >= 0, !stopping else { return }
-            Self.writeAll(fd: fd, data: data)
+            Self.writeAll(fd: fd, base: buffer.pointer, count: buffer.byteCount)
         }
     }
 
+    /// Writes mixed s16le stereo PCM audio with bounded queue backpressure.
     public func writeAudioFrame(_ data: Data) {
+        lock.lock()
+        let stopping = isStopping
+        if stopping || pendingAudioFrames >= Self.maxPendingAudioFrames {
+            lock.unlock()
+            return
+        }
+        pendingAudioFrames += 1
+        lock.unlock()
+
         audioWriteQueue.async { [weak self] in
+            defer {
+                if let self {
+                    self.lock.lock()
+                    self.pendingAudioFrames = max(0, self.pendingAudioFrames - 1)
+                    self.lock.unlock()
+                }
+            }
             guard let self else { return }
             self.lock.lock()
             let fd = self.audioFD
             let stopping = self.isStopping
             self.lock.unlock()
             guard fd >= 0, !stopping else { return }
-            Self.writeAll(fd: fd, data: data)
+            data.withUnsafeBytes { rawBuffer in
+                guard let base = rawBuffer.baseAddress else { return }
+                Self.writeAll(fd: fd, base: base, count: rawBuffer.count)
+            }
         }
     }
 
@@ -344,24 +429,25 @@ public final class RTMPStreamer: @unchecked Sendable {
         }
     }
 
-    private static func writeAll(fd: Int32, data: Data) {
-        data.withUnsafeBytes { rawBuffer in
-            guard let base = rawBuffer.baseAddress else { return }
-            var totalWritten = 0
-            let count = rawBuffer.count
-            while totalWritten < count {
-                let written = Darwin.write(fd, base.advanced(by: totalWritten), count - totalWritten)
-                if written <= 0 {
-                    break
-                }
-                totalWritten += written
+    private static func writeAll(fd: Int32, base: UnsafeRawPointer, count: Int) {
+        var totalWritten = 0
+        while totalWritten < count {
+            let written = Darwin.write(fd, base.advanced(by: totalWritten), count - totalWritten)
+            if written < 0 {
+                if errno == EINTR { continue }
+                break
             }
+            if written == 0 {
+                break
+            }
+            totalWritten += written
         }
     }
 
     private func handleStderrChunk(_ chunk: String) {
         lock.lock()
         let secrets = secretsToRedact
+        let dropped = droppedVideoFrames
         lock.unlock()
 
         let sanitized = Self.redactSecrets(in: chunk, secrets: secrets)
@@ -374,7 +460,8 @@ public final class RTMPStreamer: @unchecked Sendable {
             guard !line.isEmpty else { continue }
 
             if line.contains("frame=") && line.contains("fps=") {
-                if let telemetry = Self.parseProgressLine(line) {
+                if var telemetry = Self.parseProgressLine(line) {
+                    telemetry.droppedFrames = dropped
                     onTelemetry?(telemetry)
                 }
             } else {

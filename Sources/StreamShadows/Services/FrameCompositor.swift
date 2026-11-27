@@ -16,11 +16,67 @@ public struct CompositorConfig: Sendable {
     public init() {}
 }
 
+/// Reusable raw byte buffer to avoid 8.3 MB per-frame heap allocations at 1080p60.
+public final class PooledFrameBuffer: @unchecked Sendable {
+    public let pointer: UnsafeMutableRawPointer
+    public let byteCount: Int
+    private weak var pool: FrameBufferPool?
+
+    init(byteCount: Int, pool: FrameBufferPool) {
+        self.byteCount = byteCount
+        self.pointer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 64)
+        self.pool = pool
+    }
+
+    public func recycle() {
+        pool?.release(self)
+    }
+
+    deinit {
+        pointer.deallocate()
+    }
+}
+
+/// Thread-safe pool of reusable raw frame buffers.
+public final class FrameBufferPool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var available: [PooledFrameBuffer] = []
+    private var currentByteCount: Int = 0
+    private let maxPoolSize: Int
+
+    public init(maxPoolSize: Int = 4) {
+        self.maxPoolSize = max(2, maxPoolSize)
+    }
+
+    public func acquire(byteCount: Int) -> PooledFrameBuffer {
+        lock.lock()
+        if currentByteCount != byteCount {
+            available.removeAll()
+            currentByteCount = byteCount
+        }
+        if let reused = available.popLast() {
+            lock.unlock()
+            return reused
+        }
+        lock.unlock()
+        return PooledFrameBuffer(byteCount: byteCount, pool: self)
+    }
+
+    func release(_ buffer: PooledFrameBuffer) {
+        lock.lock()
+        if buffer.byteCount == currentByteCount && available.count < maxPoolSize {
+            available.append(buffer)
+        }
+        lock.unlock()
+    }
+}
+
 /// Real-time Metal-backed CoreImage compositor for screen, camera, and Picture-in-Picture layouts.
 public final class FrameCompositor: @unchecked Sendable {
     private let ciContext: CIContext
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private let lock = NSLock()
+    private let bufferPool = FrameBufferPool(maxPoolSize: 4)
 
     private var config = CompositorConfig()
     private var latestScreenBuffer: CVPixelBuffer?
@@ -30,8 +86,12 @@ public final class FrameCompositor: @unchecked Sendable {
     private let renderQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.compositor", qos: .userInteractive)
     private var frameCounter: Int = 0
 
+    // Wall-clock drift tracking for steady FPS over long streams
+    private var streamStartUptimeNs: UInt64 = 0
+    private var emittedVideoFrames: UInt64 = 0
+
     public var onPreviewFrame: (@Sendable (CGImage) -> Void)?
-    public var onEncodedVideoFrame: (@Sendable (Data) -> Void)?
+    public var onEncodedVideoFrame: (@Sendable (PooledFrameBuffer) -> Void)?
 
     public init() {
         self.ciContext = CIContext(options: [
@@ -43,8 +103,16 @@ public final class FrameCompositor: @unchecked Sendable {
     public func updateConfig(_ newConfig: CompositorConfig) {
         let fpsChanged: Bool
         lock.lock()
-        fpsChanged = config.fps != newConfig.fps || config.isStreaming != newConfig.isStreaming
+        let wasStreaming = config.isStreaming
+        fpsChanged = config.fps != newConfig.fps || wasStreaming != newConfig.isStreaming
         config = newConfig
+        if !wasStreaming && newConfig.isStreaming {
+            streamStartUptimeNs = DispatchTime.now().uptimeNanoseconds
+            emittedVideoFrames = 0
+        } else if wasStreaming && !newConfig.isStreaming {
+            streamStartUptimeNs = 0
+            emittedVideoFrames = 0
+        }
         lock.unlock()
 
         if fpsChanged && timer != nil {
@@ -85,7 +153,7 @@ public final class FrameCompositor: @unchecked Sendable {
             timer.schedule(
                 deadline: .now(),
                 repeating: .nanoseconds(Int(intervalNs)),
-                leeway: .milliseconds(2)
+                leeway: .milliseconds(1)
             )
             timer.setEventHandler { [weak self] in
                 self?.renderTick()
@@ -103,10 +171,27 @@ public final class FrameCompositor: @unchecked Sendable {
     }
 
     private func renderTick() {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+
         lock.lock()
         let cfg = config
         let screenBuf = latestScreenBuffer
         let cameraBuf = latestCameraBuffer
+
+        var shouldEmitStreamFrame = cfg.isStreaming
+        if cfg.isStreaming {
+            if streamStartUptimeNs == 0 {
+                streamStartUptimeNs = nowNs
+                emittedVideoFrames = 0
+            }
+            let elapsedNs = nowNs >= streamStartUptimeNs ? (nowNs - streamStartUptimeNs) : 0
+            let expectedFrames = (elapsedNs * UInt64(max(1, cfg.fps))) / 1_000_000_000 + 1
+            if expectedFrames > emittedVideoFrames {
+                emittedVideoFrames += 1
+            } else {
+                shouldEmitStreamFrame = false
+            }
+        }
         lock.unlock()
 
         let canvasWidth = cfg.width
@@ -150,7 +235,6 @@ public final class FrameCompositor: @unchecked Sendable {
                     size: cfg.pipSize
                 )
                 let pipImg = Self.aspectFillImage(camImg, into: pipRect)
-                // Subtle dark border behind PiP
                 let borderRect = pipRect.insetBy(dx: -3, dy: -3)
                 let borderImg = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.25))
                     .cropped(to: borderRect)
@@ -162,29 +246,25 @@ public final class FrameCompositor: @unchecked Sendable {
         let finalImage = composite.cropped(to: canvasRect)
         frameCounter += 1
 
-        // Emit BGRA bytes to FFmpeg when streaming
-        if cfg.isStreaming, let onEncodedVideoFrame {
+        // Emit pooled BGRA bytes to FFmpeg when streaming (zero per-frame heap allocation)
+        if shouldEmitStreamFrame, let onEncodedVideoFrame {
             let bytesPerRow = canvasWidth * 4
-            var data = Data(count: bytesPerRow * canvasHeight)
-            data.withUnsafeMutableBytes { rawBuf in
-                if let baseAddr = rawBuf.baseAddress {
-                    ciContext.render(
-                        finalImage,
-                        toBitmap: baseAddr,
-                        rowBytes: bytesPerRow,
-                        bounds: canvasRect,
-                        format: .BGRA8,
-                        colorSpace: colorSpace
-                    )
-                }
-            }
-            onEncodedVideoFrame(data)
+            let totalBytes = bytesPerRow * canvasHeight
+            let buffer = bufferPool.acquire(byteCount: totalBytes)
+            ciContext.render(
+                finalImage,
+                toBitmap: buffer.pointer,
+                rowBytes: bytesPerRow,
+                bounds: canvasRect,
+                format: .BGRA8,
+                colorSpace: colorSpace
+            )
+            onEncodedVideoFrame(buffer)
         }
 
         // Throttle preview CGImage updates when streaming at 60fps to keep SwiftUI smooth
         let previewStride = (cfg.isStreaming && cfg.fps >= 60) ? 2 : 1
         if frameCounter % previewStride == 0, let onPreviewFrame {
-            // Downscale preview slightly for snappy UI rendering
             let previewScale = min(1.0, 960.0 / CGFloat(canvasWidth))
             let previewImage = previewScale < 1.0
                 ? finalImage.transformed(by: CGAffineTransform(scaleX: previewScale, y: previewScale))

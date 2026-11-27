@@ -8,13 +8,13 @@ public final class KeychainStore: Sendable {
         self.service = service
     }
 
-    public func saveStreamKey(_ key: String, for platform: StreamingPlatform) {
+    @discardableResult
+    public func saveStreamKey(_ key: String, for platform: StreamingPlatform) -> OSStatus {
         let account = "stream_key_\(platform.rawValue)"
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if trimmed.isEmpty {
-            deleteStreamKey(for: platform)
-            return
+            return deleteStreamKey(for: platform)
         }
 
         let data = Data(trimmed.utf8)
@@ -32,8 +32,9 @@ public final class KeychainStore: Sendable {
         if status == errSecItemNotFound {
             var newItem = query
             newItem[kSecValueData as String] = data
-            SecItemAdd(newItem as CFDictionary, nil)
+            return SecItemAdd(newItem as CFDictionary, nil)
         }
+        return status
     }
 
     public func loadStreamKey(for platform: StreamingPlatform) -> String {
@@ -56,13 +57,14 @@ public final class KeychainStore: Sendable {
         return string
     }
 
-    public func deleteStreamKey(for platform: StreamingPlatform) {
+    @discardableResult
+    public func deleteStreamKey(for platform: StreamingPlatform) -> OSStatus {
         let account = "stream_key_\(platform.rawValue)"
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        return SecItemDelete(query as CFDictionary)
     }
 }

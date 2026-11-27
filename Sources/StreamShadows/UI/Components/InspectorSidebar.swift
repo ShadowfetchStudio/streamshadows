@@ -121,6 +121,10 @@ struct InspectorSidebar: View {
                             }
                         }
 
+                        Toggle("Hide StreamShadows from capture", isOn: $viewModel.excludeSelfFromCapture)
+                            .font(.callout)
+                            .help("Prevents infinite preview recursion when streaming the same screen StreamShadows is on")
+
                         if !viewModel.hasScreenPermission {
                             Button("Grant Screen Recording Access") {
                                 viewModel.requestScreenPermission()
@@ -271,14 +275,22 @@ struct InspectorSidebar: View {
                     Spacer()
 
                     if dest.isEnabled {
-                        Text(dest.isReadyToStream ? "Ready" : "Key required")
+                        let statusText: String = {
+                            if !dest.hasValidIngestURL { return "Invalid URL" }
+                            if !dest.isReadyToStream { return "Key required" }
+                            return "Ready"
+                        }()
+                        let statusColor: Color = {
+                            if !dest.hasValidIngestURL { return .red }
+                            if !dest.isReadyToStream { return .orange }
+                            return .green
+                        }()
+                        Text(statusText)
                             .font(.caption2.weight(.medium))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(
-                                Capsule().fill(dest.isReadyToStream ? Color.green.opacity(0.2) : Color.orange.opacity(0.2))
-                            )
-                            .foregroundStyle(dest.isReadyToStream ? .green : .orange)
+                            .background(Capsule().fill(statusColor.opacity(0.2)))
+                            .foregroundStyle(statusColor)
                     }
 
                     Toggle("", isOn: Binding(

@@ -58,6 +58,11 @@ struct ContentView: View {
                     Text("\(viewModel.telemetry.fps) fps")
                     Text("•")
                     Text(viewModel.telemetry.bitrate)
+                    if viewModel.telemetry.droppedFrames > 0 {
+                        Text("•")
+                        Text("\(viewModel.telemetry.droppedFrames) dropped")
+                            .foregroundStyle(.orange)
+                    }
                 }
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)

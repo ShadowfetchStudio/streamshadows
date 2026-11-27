@@ -14,10 +14,63 @@ public struct AudioMixerSettings: Sendable {
     public var masterMuted: Bool = false
     public var masterVolume: Float = 1.0
 
+    public var isStreaming: Bool = false
+
     public init() {}
 }
 
-/// Thread-safe real-time 48kHz stereo PCM audio mixer with independent system, mic, and master controls.
+/// Fixed-capacity O(1) circular ring buffer for interleaved Float32 audio samples.
+public struct FloatRingBuffer: Sendable {
+    private var storage: [Float]
+    private let capacity: Int
+    private var head: Int = 0
+    private var tail: Int = 0
+    public private(set) var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = max(1, capacity)
+        self.storage = [Float](repeating: 0, count: self.capacity)
+    }
+
+    public mutating func push(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        // If incoming chunk exceeds total capacity, keep only the newest `capacity` samples
+        let sliceStart = max(0, samples.count - capacity)
+        let incomingCount = samples.count - sliceStart
+
+        // Drop oldest samples if buffer would overflow
+        let overflow = (count + incomingCount) - capacity
+        if overflow > 0 {
+            head = (head + overflow) % capacity
+            count -= overflow
+        }
+
+        for i in sliceStart..<samples.count {
+            storage[tail] = samples[i]
+            tail = (tail + 1) % capacity
+        }
+        count += incomingCount
+    }
+
+    public mutating func pop(count requested: Int) -> [Float] {
+        var result = [Float](repeating: 0, count: requested)
+        let available = min(requested, count)
+        for i in 0..<available {
+            result[i] = storage[head]
+            head = (head + 1) % capacity
+        }
+        count -= available
+        return result
+    }
+
+    public mutating func clear() {
+        head = 0
+        tail = 0
+        count = 0
+    }
+}
+
+/// Thread-safe real-time 48kHz stereo PCM audio mixer with O(1) ring buffers, drift protection, and 16/24/32-bit PCM support.
 public final class AudioMixer: @unchecked Sendable {
     public static let sampleRate: Double = 48_000
     public static let channels: Int = 2
@@ -27,13 +80,16 @@ public final class AudioMixer: @unchecked Sendable {
     private var settings = AudioMixerSettings()
 
     // Interleaved stereo Float32 ring buffers (max ~0.5s = 48000 floats)
-    private var systemBuffer: [Float] = []
-    private var micBuffer: [Float] = []
-    private let maxBufferedSamples = 48_000
+    private var systemBuffer = FloatRingBuffer(capacity: 48_000)
+    private var micBuffer = FloatRingBuffer(capacity: 48_000)
 
     private var currentSystemPeak: Float = 0
     private var currentMicPeak: Float = 0
     private var currentMasterPeak: Float = 0
+
+    // Wall-clock drift tracking while streaming
+    private var streamStartUptimeNs: UInt64 = 0
+    private var emittedStreamChunks: UInt64 = 0
 
     private var timer: DispatchSourceTimer?
     private let mixQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.audiomixer", qos: .userInteractive)
@@ -45,7 +101,17 @@ public final class AudioMixer: @unchecked Sendable {
 
     public func updateSettings(_ newSettings: AudioMixerSettings) {
         lock.lock()
+        let wasStreaming = settings.isStreaming
         settings = newSettings
+        if !wasStreaming && newSettings.isStreaming {
+            streamStartUptimeNs = DispatchTime.now().uptimeNanoseconds
+            emittedStreamChunks = 0
+            systemBuffer.clear()
+            micBuffer.clear()
+        } else if wasStreaming && !newSettings.isStreaming {
+            streamStartUptimeNs = 0
+            emittedStreamChunks = 0
+        }
         lock.unlock()
     }
 
@@ -55,7 +121,7 @@ public final class AudioMixer: @unchecked Sendable {
             self.stopTimerLocked()
 
             let timer = DispatchSource.makeTimerSource(queue: self.mixQueue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(2))
+            timer.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(1))
             timer.setEventHandler { [weak self] in
                 self?.mixTick()
             }
@@ -78,11 +144,13 @@ public final class AudioMixer: @unchecked Sendable {
 
     private func clearBuffers() {
         lock.lock()
-        systemBuffer.removeAll(keepingCapacity: true)
-        micBuffer.removeAll(keepingCapacity: true)
+        systemBuffer.clear()
+        micBuffer.clear()
         currentSystemPeak = 0
         currentMicPeak = 0
         currentMasterPeak = 0
+        streamStartUptimeNs = 0
+        emittedStreamChunks = 0
         lock.unlock()
     }
 
@@ -98,10 +166,7 @@ public final class AudioMixer: @unchecked Sendable {
         currentSystemPeak = max(peak, currentSystemPeak * 0.7)
 
         if settings.systemAudioEnabled {
-            systemBuffer.append(contentsOf: stereo)
-            if systemBuffer.count > maxBufferedSamples {
-                systemBuffer.removeFirst(systemBuffer.count - maxBufferedSamples)
-            }
+            systemBuffer.push(stereo)
         }
         lock.unlock()
     }
@@ -118,66 +183,81 @@ public final class AudioMixer: @unchecked Sendable {
         currentMicPeak = max(peak, currentMicPeak * 0.7)
 
         if settings.micAudioEnabled {
-            micBuffer.append(contentsOf: stereo)
-            if micBuffer.count > maxBufferedSamples {
-                micBuffer.removeFirst(micBuffer.count - maxBufferedSamples)
-            }
+            micBuffer.push(stereo)
         }
         lock.unlock()
     }
 
     private func mixTick() {
         let sampleCount = Self.chunkFrames * Self.channels
+        let nowNs = DispatchTime.now().uptimeNanoseconds
 
         lock.lock()
         let cfg = settings
-        let sysChunk = Self.popSamples(from: &systemBuffer, count: sampleCount)
-        let micChunk = Self.popSamples(from: &micBuffer, count: sampleCount)
-        // Smooth decay for UI meters
-        currentSystemPeak *= 0.85
-        currentMicPeak *= 0.85
-        let sysPeakSnapshot = min(currentSystemPeak, 1.0)
-        let micPeakSnapshot = min(currentMicPeak, 1.0)
+        let chunksToEmit: Int
+        if cfg.isStreaming {
+            if streamStartUptimeNs == 0 {
+                streamStartUptimeNs = nowNs
+                emittedStreamChunks = 0
+            }
+            let elapsedNs = nowNs >= streamStartUptimeNs ? (nowNs - streamStartUptimeNs) : 0
+            let expectedChunks = (elapsedNs / 20_000_000) + 1
+            if expectedChunks > emittedStreamChunks {
+                // Cap catch-up to at most 3 chunks per tick to avoid bursts
+                chunksToEmit = Int(min(3, expectedChunks - emittedStreamChunks))
+                emittedStreamChunks += UInt64(chunksToEmit)
+            } else {
+                chunksToEmit = 0
+            }
+        } else {
+            chunksToEmit = 1
+        }
         lock.unlock()
+
+        guard chunksToEmit > 0 else { return }
 
         let sysGain: Float = (cfg.systemAudioEnabled && !cfg.systemAudioMuted) ? cfg.systemAudioVolume : 0
         let micGain: Float = (cfg.micAudioEnabled && !cfg.micAudioMuted) ? cfg.micAudioVolume : 0
         let masterGain: Float = cfg.masterMuted ? 0 : cfg.masterVolume
 
-        let (pcmData, masterPeak) = Self.mixToInt16PCM(
-            systemSamples: sysChunk,
-            micSamples: micChunk,
-            systemGain: sysGain,
-            micGain: micGain,
-            masterGain: masterGain
-        )
+        var latestSysPeak: Float = 0
+        var latestMicPeak: Float = 0
+        var latestMasterPeak: Float = 0
 
-        lock.lock()
-        currentMasterPeak = max(masterPeak, currentMasterPeak * 0.8)
-        let masterPeakSnapshot = min(currentMasterPeak, 1.0)
-        lock.unlock()
+        for _ in 0..<chunksToEmit {
+            lock.lock()
+            let sysChunk = systemBuffer.pop(count: sampleCount)
+            let micChunk = micBuffer.pop(count: sampleCount)
+            currentSystemPeak *= 0.85
+            currentMicPeak *= 0.85
+            latestSysPeak = min(currentSystemPeak, 1.0)
+            latestMicPeak = min(currentMicPeak, 1.0)
+            lock.unlock()
 
-        onMixedPCMFrame?(pcmData)
-        onLevelsUpdated?(AudioLevels(
-            systemPeak: sysPeakSnapshot,
-            micPeak: micPeakSnapshot,
-            masterPeak: masterPeakSnapshot
-        ))
-    }
+            let (pcmData, masterPeak) = Self.mixToInt16PCM(
+                systemSamples: sysChunk,
+                micSamples: micChunk,
+                systemGain: sysGain,
+                micGain: micGain,
+                masterGain: masterGain
+            )
 
-    private static func popSamples(from buffer: inout [Float], count: Int) -> [Float] {
-        if buffer.count >= count {
-            let slice = Array(buffer.prefix(count))
-            buffer.removeFirst(count)
-            return slice
-        } else if !buffer.isEmpty {
-            var result = buffer
-            buffer.removeAll(keepingCapacity: true)
-            result.append(contentsOf: repeatElement(Float(0), count: count - result.count))
-            return result
-        } else {
-            return [Float](repeating: 0, count: count)
+            lock.lock()
+            currentMasterPeak = max(masterPeak, currentMasterPeak * 0.8)
+            latestMasterPeak = min(currentMasterPeak, 1.0)
+            lock.unlock()
+
+            // Only emit PCM to FFmpeg when actively streaming
+            if cfg.isStreaming {
+                onMixedPCMFrame?(pcmData)
+            }
         }
+
+        onLevelsUpdated?(AudioLevels(
+            systemPeak: latestSysPeak,
+            micPeak: latestMicPeak,
+            masterPeak: latestMasterPeak
+        ))
     }
 
     /// Mixes two equal-length stereo Float32 buffers with soft-clipping and converts to interleaved s16le PCM.
@@ -211,7 +291,51 @@ public final class AudioMixer: @unchecked Sendable {
         return tanh(sample)
     }
 
-    /// Extracts audio from a CMSampleBuffer into interleaved 48kHz stereo Float32 samples.
+    /// Linearly resamples interleaved stereo Float32 samples between sample rates.
+    public static func resampleStereo(_ stereo: [Float], fromSampleRate: Double, toSampleRate: Double = sampleRate) -> [Float] {
+        let numFrames = stereo.count / 2
+        guard numFrames > 0, fromSampleRate > 0, abs(fromSampleRate - toSampleRate) > 10 else {
+            return stereo
+        }
+        let ratio = toSampleRate / fromSampleRate
+        let outFrames = max(1, Int((Double(numFrames) * ratio).rounded()))
+        var resampled = [Float](repeating: 0, count: outFrames * 2)
+        for outF in 0..<outFrames {
+            let srcPos = Double(outF) / ratio
+            let idx0 = min(numFrames - 1, Int(srcPos))
+            let idx1 = min(numFrames - 1, idx0 + 1)
+            let frac = Float(srcPos - Double(idx0))
+            resampled[outF * 2] = stereo[idx0 * 2] * (1 - frac) + stereo[idx1 * 2] * frac
+            resampled[outF * 2 + 1] = stereo[idx0 * 2 + 1] * (1 - frac) + stereo[idx1 * 2 + 1] * frac
+        }
+        return resampled
+    }
+
+    /// Decodes packed 24-bit signed little-endian PCM bytes into interleaved stereo Float32.
+    public static func decode24BitSignedInterleaved(_ bytes: UnsafePointer<UInt8>, numFrames: Int, channels: Int) -> [Float] {
+        let ch = max(1, channels)
+        var stereo = [Float](repeating: 0, count: numFrames * 2)
+        let scale: Float = 1.0 / 8_388_608.0 // 2^23
+
+        func readSample(at byteOffset: Int) -> Float {
+            let b0 = Int32(bytes[byteOffset])
+            let b1 = Int32(bytes[byteOffset + 1]) << 8
+            let b2 = Int32(Int8(bitPattern: bytes[byteOffset + 2])) << 16
+            let value = b0 | b1 | b2
+            return Float(value) * scale
+        }
+
+        for f in 0..<numFrames {
+            let frameBase = f * ch * 3
+            let left = readSample(at: frameBase)
+            let right = ch > 1 ? readSample(at: frameBase + 3) : left
+            stereo[f * 2] = left
+            stereo[f * 2 + 1] = right
+        }
+        return stereo
+    }
+
+    /// Extracts audio from a CMSampleBuffer into interleaved 48kHz stereo Float32 samples (supports 32f, 16i, 24i, 32i).
     public static func extractStereoFloat32(from sampleBuffer: CMSampleBuffer) -> [Float]? {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
@@ -285,7 +409,7 @@ public final class AudioMixer: @unchecked Sendable {
                 }
             }
         } else if isSignedInt && asbd.mBitsPerChannel == 16 {
-            let scale: Float = 1.0 / 32768.0
+            let scale: Float = 1.0 / 32_768.0
             if isNonInterleaved {
                 guard let leftData = audioBuffers[0].mData?.assumingMemoryBound(to: Int16.self) else { return nil }
                 let rightData = audioBuffers.count > 1
@@ -304,26 +428,33 @@ public final class AudioMixer: @unchecked Sendable {
                     stereo[f * 2 + 1] = Float(channelCount > 1 ? data[base + 1] : data[base]) * scale
                 }
             }
+        } else if isSignedInt && asbd.mBitsPerChannel == 24 && !isNonInterleaved {
+            guard let bytes = audioBuffers[0].mData?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            stereo = decode24BitSignedInterleaved(bytes, numFrames: numFrames, channels: channelCount)
+        } else if isSignedInt && asbd.mBitsPerChannel == 32 {
+            let scale: Float = 1.0 / 2_147_483_648.0 // 2^31
+            if isNonInterleaved {
+                guard let leftData = audioBuffers[0].mData?.assumingMemoryBound(to: Int32.self) else { return nil }
+                let rightData = audioBuffers.count > 1
+                    ? audioBuffers[1].mData?.assumingMemoryBound(to: Int32.self)
+                    : leftData
+                guard let rData = rightData else { return nil }
+                for f in 0..<numFrames {
+                    stereo[f * 2] = Float(leftData[f]) * scale
+                    stereo[f * 2 + 1] = Float(rData[f]) * scale
+                }
+            } else {
+                guard let data = audioBuffers[0].mData?.assumingMemoryBound(to: Int32.self) else { return nil }
+                for f in 0..<numFrames {
+                    let base = f * channelCount
+                    stereo[f * 2] = Float(data[base]) * scale
+                    stereo[f * 2 + 1] = Float(channelCount > 1 ? data[base + 1] : data[base]) * scale
+                }
+            }
         } else {
             return nil
         }
 
-        // Linear resample if source sample rate differs from 48kHz (e.g., 44.1kHz mic)
-        if abs(asbd.mSampleRate - sampleRate) > 10 && asbd.mSampleRate > 0 {
-            let ratio = sampleRate / asbd.mSampleRate
-            let outFrames = max(1, Int((Double(numFrames) * ratio).rounded()))
-            var resampled = [Float](repeating: 0, count: outFrames * 2)
-            for outF in 0..<outFrames {
-                let srcPos = Double(outF) / ratio
-                let idx0 = min(numFrames - 1, Int(srcPos))
-                let idx1 = min(numFrames - 1, idx0 + 1)
-                let frac = Float(srcPos - Double(idx0))
-                resampled[outF * 2] = stereo[idx0 * 2] * (1 - frac) + stereo[idx1 * 2] * frac
-                resampled[outF * 2 + 1] = stereo[idx0 * 2 + 1] * (1 - frac) + stereo[idx1 * 2 + 1] * frac
-            }
-            return resampled
-        }
-
-        return stereo
+        return resampleStereo(stereo, fromSampleRate: asbd.mSampleRate, toSampleRate: sampleRate)
     }
 }

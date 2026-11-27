@@ -2,13 +2,14 @@ import XCTest
 @testable import StreamShadows
 
 final class StreamShadowsTests: XCTestCase {
-    func testDestinationFullRTMPURLFormatting() {
+    func testDestinationFullRTMPURLFormattingAndValidation() {
         let yt = StreamDestinationConfig(
             platform: .youtube,
             isEnabled: true,
             ingestURL: "rtmps://a.rtmps.youtube.com/live2/",
             streamKey: "abcd-1234"
         )
+        XCTAssertTrue(yt.hasValidIngestURL)
         XCTAssertEqual(yt.fullRTMPURL, "rtmps://a.rtmps.youtube.com/live2/abcd-1234")
         XCTAssertTrue(yt.isReadyToStream)
 
@@ -18,6 +19,7 @@ final class StreamShadowsTests: XCTestCase {
             ingestURL: "rtmp://live.twitch.tv/app",
             streamKey: "live_999"
         )
+        XCTAssertTrue(twitchNoSlash.hasValidIngestURL)
         XCTAssertEqual(twitchNoSlash.fullRTMPURL, "rtmp://live.twitch.tv/app/live_999")
 
         let xEmptyKey = StreamDestinationConfig(
@@ -26,11 +28,23 @@ final class StreamShadowsTests: XCTestCase {
             ingestURL: "rtmps://va.pscp.tv:443/x/",
             streamKey: "   "
         )
+        XCTAssertTrue(xEmptyKey.hasValidIngestURL)
         XCTAssertNil(xEmptyKey.fullRTMPURL)
         XCTAssertFalse(xEmptyKey.isReadyToStream)
+
+        // Reject non-RTMP(S) schemes
+        let badScheme = StreamDestinationConfig(
+            platform: .youtube,
+            isEnabled: true,
+            ingestURL: "https://example.com/live/",
+            streamKey: "key123"
+        )
+        XCTAssertFalse(badScheme.hasValidIngestURL)
+        XCTAssertNil(badScheme.fullRTMPURL)
+        XCTAssertFalse(badScheme.isReadyToStream)
     }
 
-    func testFFmpegSingleAndMultiDestinationArguments() {
+    func testFFmpegSingleAndMultiDestinationArgumentsAndTeeEscaping() {
         let singleArgs = RTMPStreamer.buildFFmpegArguments(
             videoPipePath: "/tmp/v.fifo",
             audioPipePath: "/tmp/a.fifo",
@@ -48,13 +62,15 @@ final class StreamShadowsTests: XCTestCase {
             preset: .p720_60,
             encoder: .softwareX264,
             destinationURLs: [
-                "rtmps://a.rtmps.youtube.com/live2/key1",
-                "rtmp://live.twitch.tv/app/key2"
+                "rtmps://a.rtmps.youtube.com/live2/key|1",
+                "rtmp://live.twitch.tv/app/key[2]"
             ]
         )
         XCTAssertTrue(multiArgs.contains("libx264"))
         XCTAssertTrue(multiArgs.contains("tee"))
-        XCTAssertTrue(multiArgs.contains { $0.contains("[f=flv:onfail=ignore]rtmps://a.rtmps.youtube.com/live2/key1|[f=flv:onfail=ignore]rtmp://live.twitch.tv/app/key2") })
+        XCTAssertTrue(multiArgs.contains {
+            $0.contains(#"[f=flv:onfail=ignore]rtmps://a.rtmps.youtube.com/live2/key\|1|[f=flv:onfail=ignore]rtmp://live.twitch.tv/app/key\[2\]"#)
+        })
     }
 
     func testSecretRedactionInLogs() {
@@ -90,7 +106,6 @@ final class StreamShadowsTests: XCTestCase {
         XCTAssertLessThanOrEqual(peak, 1.0)
         XCTAssertGreaterThan(peak, 0.9)
 
-        // Muted master should produce silence
         let (silentData, silentPeak) = AudioMixer.mixToInt16PCM(
             systemSamples: sys,
             micSamples: mic,
@@ -100,5 +115,67 @@ final class StreamShadowsTests: XCTestCase {
         )
         XCTAssertEqual(silentPeak, 0.0)
         XCTAssertTrue(silentData.allSatisfy { $0 == 0 })
+    }
+
+    func testFloatRingBufferWraparoundOverflowAndUnderrun() {
+        var ring = FloatRingBuffer(capacity: 4)
+        ring.push([1, 2, 3])
+        XCTAssertEqual(ring.count, 3)
+
+        let first = ring.pop(count: 2)
+        XCTAssertEqual(first, [1, 2])
+        XCTAssertEqual(ring.count, 1)
+
+        // Wrap around and overflow oldest sample (3)
+        ring.push([4, 5, 6, 7])
+        XCTAssertEqual(ring.count, 4)
+        let second = ring.pop(count: 6) // Request more than available -> zero padded
+        XCTAssertEqual(second, [4, 5, 6, 7, 0, 0])
+        XCTAssertEqual(ring.count, 0)
+    }
+
+    func testAudioResampling44100To48000() {
+        // 441 frames at 44.1kHz = 10ms -> should resample to 480 frames at 48kHz
+        var input = [Float](repeating: 0, count: 441 * 2)
+        for i in 0..<441 {
+            input[i * 2] = 0.5
+            input[i * 2 + 1] = -0.25
+        }
+        let output = AudioMixer.resampleStereo(input, fromSampleRate: 44_100, toSampleRate: 48_000)
+        XCTAssertEqual(output.count, 480 * 2)
+        XCTAssertEqual(output[0], 0.5, accuracy: 0.001)
+        XCTAssertEqual(output[1], -0.25, accuracy: 0.001)
+        XCTAssertEqual(output[output.count - 2], 0.5, accuracy: 0.001)
+        XCTAssertEqual(output[output.count - 1], -0.25, accuracy: 0.001)
+    }
+
+    func testDecode24BitSignedInterleavedPCM() {
+        // 2 frames of mono 24-bit signed LE:
+        // Frame 0: +0x400000 (+0.5 full scale) -> bytes [0x00, 0x00, 0x40]
+        // Frame 1: -0x400000 (-0.5 full scale, 0xC00000) -> bytes [0x00, 0x00, 0xC0]
+        let rawBytes: [UInt8] = [0x00, 0x00, 0x40, 0x00, 0x00, 0xC0]
+        let decoded = rawBytes.withUnsafeBufferPointer { ptr in
+            AudioMixer.decode24BitSignedInterleaved(ptr.baseAddress!, numFrames: 2, channels: 1)
+        }
+        XCTAssertEqual(decoded.count, 4)
+        XCTAssertEqual(decoded[0], 0.5, accuracy: 0.001)
+        XCTAssertEqual(decoded[1], 0.5, accuracy: 0.001) // mono upmixed to stereo
+        XCTAssertEqual(decoded[2], -0.5, accuracy: 0.001)
+        XCTAssertEqual(decoded[3], -0.5, accuracy: 0.001)
+    }
+
+    func testFrameBufferPoolReuseAndResize() {
+        let pool = FrameBufferPool(maxPoolSize: 2)
+        let buf1 = pool.acquire(byteCount: 1024)
+        let ptr1 = buf1.pointer
+        buf1.recycle()
+
+        let buf2 = pool.acquire(byteCount: 1024)
+        XCTAssertEqual(buf2.pointer, ptr1, "Expected pool to reuse recycled buffer of matching size")
+        buf2.recycle()
+
+        let buf3 = pool.acquire(byteCount: 2048)
+        XCTAssertEqual(buf3.byteCount, 2048)
+        buf3.recycle()
     }
 }

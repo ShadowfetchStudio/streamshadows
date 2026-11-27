@@ -138,10 +138,21 @@ public struct StreamDestinationConfig: Identifiable, Equatable, Sendable {
         self.streamKey = streamKey
     }
 
+    public var hasValidIngestURL: Bool {
+        let base = ingestURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: base),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "rtmp" || scheme == "rtmps"),
+              let host = url.host, !host.isEmpty else {
+            return false
+        }
+        return true
+    }
+
     public var fullRTMPURL: String? {
         let base = ingestURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = streamKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty, !key.isEmpty else { return nil }
+        guard hasValidIngestURL, !key.isEmpty else { return nil }
         if base.hasSuffix("/") {
             return base + key
         } else {
@@ -256,6 +267,7 @@ public struct StreamTelemetry: Equatable, Sendable {
     public var bitrate: String = "0 kbps"
     public var speed: String = "0x"
     public var framesSent: Int = 0
+    public var droppedFrames: Int = 0
 }
 
 public enum StreamState: Equatable, Sendable {

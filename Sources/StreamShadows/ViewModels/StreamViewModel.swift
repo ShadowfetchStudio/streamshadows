@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CoreGraphics
+import AVFoundation
 
 @MainActor
 public final class StreamViewModel: ObservableObject {
@@ -49,12 +50,18 @@ public final class StreamViewModel: ObservableObject {
         }
     }
 
+    @Published public var excludeSelfFromCapture: Bool = true {
+        didSet {
+            savePreferences()
+            Task { await reconfigureScreenCapture() }
+        }
+    }
+
     // MARK: - Audio Mixer
     @Published public var systemAudioEnabled: Bool = true {
         didSet {
             savePreferences()
             pushAudioMixerSettings()
-            Task { await reconfigureScreenCapture() }
         }
     }
     @Published public var systemAudioMuted: Bool = false {
@@ -135,6 +142,7 @@ public final class StreamViewModel: ObservableObject {
     private let audioMixer = AudioMixer()
     private let streamer = RTMPStreamer()
     private let keychain = KeychainStore()
+    private let sleepPreventer = SleepPreventer()
     private let defaults = UserDefaults.standard
 
     private var uptimeTimer: Timer?
@@ -143,8 +151,8 @@ public final class StreamViewModel: ObservableObject {
     private var hasAutoPromptedMic = false
     private var isRequestingCameraPermission = false
     private var hasAutoPromptedCamera = false
-    private var screenParamsObserver: NSObjectProtocol?
-    private var appActiveObserver: NSObjectProtocol?
+    private var notificationObservers: [NSObjectProtocol] = []
+    private var keychainSaveTasks: [StreamingPlatform: Task<Void, Never>] = [:]
 
     public init() {
         loadPreferences()
@@ -174,30 +182,49 @@ public final class StreamViewModel: ObservableObject {
             selectedDisplayID = displays.first?.id
         }
 
-        screenParamsObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                await self?.refreshAllDevices()
-            }
-        }
-
-        appActiveObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                let hadScreen = self.hasScreenPermission
-                self.refreshPermissionStatus()
-                if !hadScreen && self.hasScreenPermission {
-                    await self.refreshAllDevices()
-                    await self.reconfigureScreenCapture()
+        let nc = NotificationCenter.default
+        notificationObservers.append(
+            nc.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    await self?.refreshAllDevices()
                 }
             }
+        )
+
+        notificationObservers.append(
+            nc.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    let hadScreen = self.hasScreenPermission
+                    self.refreshPermissionStatus()
+                    if !hadScreen && self.hasScreenPermission {
+                        await self.refreshAllDevices()
+                        await self.reconfigureScreenCapture()
+                    }
+                }
+            }
+        )
+
+        // Hot-plug camera & microphone detection
+        for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
+            notificationObservers.append(
+                nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        await self.refreshAllDevices()
+                        self.reconfigureCameraCapture()
+                        self.reconfigureMicCapture()
+                    }
+                }
+            )
         }
 
         refreshPermissionStatus()
@@ -212,16 +239,14 @@ public final class StreamViewModel: ObservableObject {
     }
 
     public func shutdown() {
-        if let observer = screenParamsObserver {
+        flushPendingKeychainSaves()
+        for observer in notificationObservers {
             NotificationCenter.default.removeObserver(observer)
-            screenParamsObserver = nil
         }
-        if let observer = appActiveObserver {
-            NotificationCenter.default.removeObserver(observer)
-            appActiveObserver = nil
-        }
+        notificationObservers.removeAll()
         uptimeTimer?.invalidate()
         uptimeTimer = nil
+        sleepPreventer.endPreventingSleep()
         streamer.stop()
         compositor.stop()
         audioMixer.stop()
@@ -360,7 +385,7 @@ public final class StreamViewModel: ObservableObject {
                     width: qualityPreset.width,
                     height: qualityPreset.height,
                     fps: qualityPreset.fps,
-                    captureSystemAudio: systemAudioEnabled
+                    excludeSelf: excludeSelfFromCapture
                 )
                 hasScreenPermission = true
                 statusBanner = nil
@@ -422,10 +447,38 @@ public final class StreamViewModel: ObservableObject {
 
     public func updateDestination(_ updated: StreamDestinationConfig) {
         if let idx = destinations.firstIndex(where: { $0.platform == updated.platform }) {
+            let keyChanged = destinations[idx].streamKey != updated.streamKey
             destinations[idx] = updated
-            keychain.saveStreamKey(updated.streamKey, for: updated.platform)
             savePreferences()
+
+            if keyChanged {
+                let platform = updated.platform
+                let key = updated.streamKey
+                keychainSaveTasks[platform]?.cancel()
+                keychainSaveTasks[platform] = Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(400))
+                    guard !Task.isCancelled, let self else { return }
+                    let status = self.keychain.saveStreamKey(key, for: platform)
+                    if status != errSecSuccess && status != errSecItemNotFound {
+                        self.appendLog("Keychain save warning for \(platform.displayName): OSStatus \(status)")
+                    }
+                    self.keychainSaveTasks.removeValue(forKey: platform)
+                }
+            }
         }
+    }
+
+    private func flushPendingKeychainSaves() {
+        for (platform, task) in keychainSaveTasks {
+            task.cancel()
+            if let dest = destinations.first(where: { $0.platform == platform }) {
+                let status = keychain.saveStreamKey(dest.streamKey, for: platform)
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    appendLog("Keychain save warning for \(platform.displayName): OSStatus \(status)")
+                }
+            }
+        }
+        keychainSaveTasks.removeAll()
     }
 
     public func resetIngestURL(for platform: StreamingPlatform) {
@@ -447,6 +500,7 @@ public final class StreamViewModel: ObservableObject {
 
     public func startStream() {
         guard !streamState.isActive else { return }
+        flushPendingKeychainSaves()
 
         guard detectedFFmpegPath != nil else {
             streamState = .error(RTMPStreamerError.ffmpegNotFound.localizedDescription)
@@ -470,12 +524,14 @@ public final class StreamViewModel: ObservableObject {
                 encoder: encoderPreference,
                 customFFmpegPath: customFFmpegPath
             )
-            let startTime = Date()
-            streamState = .live(startedAt: startTime)
+            sleepPreventer.beginPreventingSleep()
             updateCompositorConfig()
-            startUptimeTimer(from: startTime)
+            pushAudioMixerSettings()
         } catch {
+            sleepPreventer.endPreventingSleep()
             streamState = .error(error.localizedDescription)
+            updateCompositorConfig()
+            pushAudioMixerSettings()
             appendLog("Start failed: \(error.localizedDescription)")
         }
     }
@@ -485,7 +541,9 @@ public final class StreamViewModel: ObservableObject {
         streamState = .stopping
         uptimeTimer?.invalidate()
         uptimeTimer = nil
+        sleepPreventer.endPreventingSleep()
         updateCompositorConfig()
+        pushAudioMixerSettings()
         streamer.stop()
         appendLog("Stopping stream…")
     }
@@ -539,7 +597,15 @@ public final class StreamViewModel: ObservableObject {
 
         streamer.onTelemetry = { [weak self] stats in
             Task { @MainActor in
-                self?.telemetry = stats
+                guard let self else { return }
+                self.telemetry = stats
+                // Transition from CONNECTING (.starting) to LIVE only once FFmpeg confirms frames are being pushed
+                if self.streamState == .starting && stats.framesSent > 0 {
+                    let startTime = Date()
+                    self.streamState = .live(startedAt: startTime)
+                    self.startUptimeTimer(from: startTime)
+                    self.appendLog("RTMP handshake established — stream is LIVE.")
+                }
             }
         }
         streamer.onLogLine = { [weak self] line in
@@ -552,6 +618,7 @@ public final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.uptimeTimer?.invalidate()
                 self.uptimeTimer = nil
+                self.sleepPreventer.endPreventingSleep()
                 if let errorMessage {
                     self.streamState = .error(errorMessage)
                     self.appendLog(errorMessage)
@@ -560,6 +627,7 @@ public final class StreamViewModel: ObservableObject {
                     self.appendLog("Stream stopped cleanly (exit \(code)).")
                 }
                 self.updateCompositorConfig()
+                self.pushAudioMixerSettings()
             }
         }
     }
@@ -573,7 +641,7 @@ public final class StreamViewModel: ObservableObject {
         cfg.width = qualityPreset.width
         cfg.height = qualityPreset.height
         cfg.fps = qualityPreset.fps
-        cfg.isStreaming = streamState.isLive
+        cfg.isStreaming = (streamState == .starting || streamState.isLive)
         compositor.updateConfig(cfg)
     }
 
@@ -587,6 +655,7 @@ public final class StreamViewModel: ObservableObject {
         s.micAudioVolume = micAudioVolume
         s.masterMuted = masterMuted
         s.masterVolume = masterVolume
+        s.isStreaming = (streamState == .starting || streamState.isLive)
         audioMixer.updateSettings(s)
     }
 
@@ -633,6 +702,9 @@ public final class StreamViewModel: ObservableObject {
         if defaults.object(forKey: "mirrorCamera") != nil {
             mirrorCamera = defaults.bool(forKey: "mirrorCamera")
         }
+        if defaults.object(forKey: "excludeSelfFromCapture") != nil {
+            excludeSelfFromCapture = defaults.bool(forKey: "excludeSelfFromCapture")
+        }
         if defaults.object(forKey: "systemAudioEnabled") != nil {
             systemAudioEnabled = defaults.bool(forKey: "systemAudioEnabled")
         }
@@ -674,6 +746,7 @@ public final class StreamViewModel: ObservableObject {
         defaults.set(pipPosition.rawValue, forKey: "pipPosition")
         defaults.set(pipSize.rawValue, forKey: "pipSize")
         defaults.set(mirrorCamera, forKey: "mirrorCamera")
+        defaults.set(excludeSelfFromCapture, forKey: "excludeSelfFromCapture")
         defaults.set(systemAudioEnabled, forKey: "systemAudioEnabled")
         defaults.set(systemAudioVolume, forKey: "systemAudioVolume")
         defaults.set(micAudioEnabled, forKey: "micAudioEnabled")

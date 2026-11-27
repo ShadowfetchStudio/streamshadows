@@ -8,13 +8,16 @@ import AppKit
 
 /// Coordinates macOS ScreenCaptureKit (display video + system audio) and AVFoundation (camera + microphone).
 public final class CaptureManager: NSObject, @unchecked Sendable {
+    private let stateLock = NSLock()
+
     private var scStream: SCStream?
     private var availableDisplays: [SCDisplay] = []
+    private var availableApplications: [SCRunningApplication] = []
     private var activeDisplayID: CGDirectDisplayID?
     private var activeDisplayWidth: Int = 0
     private var activeDisplayHeight: Int = 0
     private var activeDisplayFPS: Int = 0
-    private var activeDisplayAudio: Bool = false
+    private var activeExcludeSelf: Bool = true
 
     private var cameraSession: AVCaptureSession?
     private var activeCameraID: String?
@@ -90,7 +93,10 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            self.availableDisplays = content.displays
+            stateLock.withLock {
+                self.availableDisplays = content.displays
+                self.availableApplications = content.applications
+            }
 
             if !screenDisplays.isEmpty {
                 return screenDisplays
@@ -107,7 +113,6 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
                 )
             }
         } catch {
-            // Still return physical displays from NSScreen so the user can always see and select screens
             if !screenDisplays.isEmpty {
                 return screenDisplays
             }
@@ -144,30 +149,59 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
     // MARK: - Screen Capture
 
-    public func startScreenCapture(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, captureSystemAudio: Bool) async throws {
-        if scStream != nil,
-           activeDisplayID == displayID,
-           activeDisplayWidth == width,
-           activeDisplayHeight == height,
-           activeDisplayFPS == fps,
-           activeDisplayAudio == captureSystemAudio {
+    /// Always captures system audio alongside screen video so enabling/muting Desktop Sound in AudioMixer never glitches video.
+    public func startScreenCapture(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, excludeSelf: Bool) async throws {
+        let alreadyMatching = stateLock.withLock {
+            scStream != nil
+                && activeDisplayID == displayID
+                && activeDisplayWidth == width
+                && activeDisplayHeight == height
+                && activeDisplayFPS == fps
+                && activeExcludeSelf == excludeSelf
+        }
+
+        if alreadyMatching {
             return
         }
 
         await stopScreenCapture()
 
-        if availableDisplays.isEmpty || !availableDisplays.contains(where: { $0.displayID == displayID }) {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            self.availableDisplays = content.displays
+        let needsRefresh = stateLock.withLock {
+            availableDisplays.isEmpty
+                || !availableDisplays.contains(where: { $0.displayID == displayID })
+                || (excludeSelf && availableApplications.isEmpty)
         }
 
-        guard let targetDisplay = availableDisplays.first(where: { $0.displayID == displayID }) ?? availableDisplays.first else {
+        if needsRefresh {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            stateLock.withLock {
+                self.availableDisplays = content.displays
+                self.availableApplications = content.applications
+            }
+        }
+
+        let (targetDisplay, apps) = stateLock.withLock {
+            (
+                availableDisplays.first(where: { $0.displayID == displayID }) ?? availableDisplays.first,
+                availableApplications
+            )
+        }
+
+        guard let targetDisplay else {
             throw NSError(domain: "StreamShadows", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "No display available to capture. Grant Screen Recording permission in System Settings."
             ])
         }
 
-        let filter = SCContentFilter(display: targetDisplay, excludingWindows: [])
+        let filter: SCContentFilter
+        if excludeSelf {
+            let myPID = ProcessInfo.processInfo.processIdentifier
+            let excludedApps = apps.filter { $0.processID == myPID }
+            filter = SCContentFilter(display: targetDisplay, excludingApplications: excludedApps, exceptingWindows: [])
+        } else {
+            filter = SCContentFilter(display: targetDisplay, excludingWindows: [])
+        }
+
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
@@ -175,29 +209,35 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = true
         config.queueDepth = 5
-        config.capturesAudio = captureSystemAudio
+        config.capturesAudio = true
         config.sampleRate = 48_000
         config.channelCount = 2
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenVideoQueue)
-        if captureSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: screenAudioQueue)
-        }
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: screenAudioQueue)
 
         try await stream.startCapture()
-        self.scStream = stream
-        self.activeDisplayID = targetDisplay.displayID
-        self.activeDisplayWidth = width
-        self.activeDisplayHeight = height
-        self.activeDisplayFPS = fps
-        self.activeDisplayAudio = captureSystemAudio
+
+        stateLock.withLock {
+            self.scStream = stream
+            self.activeDisplayID = targetDisplay.displayID
+            self.activeDisplayWidth = width
+            self.activeDisplayHeight = height
+            self.activeDisplayFPS = fps
+            self.activeExcludeSelf = excludeSelf
+        }
     }
 
     public func stopScreenCapture() async {
-        activeDisplayID = nil
-        if let stream = scStream {
+        let stream: SCStream? = stateLock.withLock {
+            let current = scStream
             scStream = nil
+            activeDisplayID = nil
+            return current
+        }
+
+        if let stream {
             try? await stream.stopCapture()
         }
     }
@@ -205,7 +245,10 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     // MARK: - Camera Capture
 
     public func startCameraCapture(deviceID: String) throws {
-        if cameraSession != nil, activeCameraID == deviceID {
+        stateLock.lock()
+        let alreadyMatching = cameraSession != nil && activeCameraID == deviceID
+        stateLock.unlock()
+        if alreadyMatching {
             return
         }
         stopCameraCapture()
@@ -245,17 +288,24 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         session.addOutput(output)
         session.commitConfiguration()
 
+        stateLock.lock()
         self.cameraSession = session
         self.activeCameraID = deviceID
+        stateLock.unlock()
+
         cameraQueue.async {
             session.startRunning()
         }
     }
 
     public func stopCameraCapture() {
+        stateLock.lock()
+        let session = cameraSession
+        cameraSession = nil
         activeCameraID = nil
-        if let session = cameraSession {
-            cameraSession = nil
+        stateLock.unlock()
+
+        if let session {
             cameraQueue.async {
                 if session.isRunning {
                     session.stopRunning()
@@ -267,7 +317,10 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     // MARK: - Microphone Capture
 
     public func startMicrophoneCapture(deviceID: String) throws {
-        if micSession != nil, activeMicID == deviceID {
+        stateLock.lock()
+        let alreadyMatching = micSession != nil && activeMicID == deviceID
+        stateLock.unlock()
+        if alreadyMatching {
             return
         }
         stopMicrophoneCapture()
@@ -290,6 +343,15 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         session.addInput(input)
 
         let output = AVCaptureAudioDataOutput()
+        // Request canonical 48kHz stereo Float32 PCM so 24-bit/32-bit USB & XLR interfaces convert cleanly in CoreAudio
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 2,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false
+        ]
         output.setSampleBufferDelegate(self, queue: micQueue)
 
         guard session.canAddOutput(output) else {
@@ -300,17 +362,24 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         session.addOutput(output)
         session.commitConfiguration()
 
+        stateLock.lock()
         self.micSession = session
         self.activeMicID = deviceID
+        stateLock.unlock()
+
         micQueue.async {
             session.startRunning()
         }
     }
 
     public func stopMicrophoneCapture() {
+        stateLock.lock()
+        let session = micSession
+        micSession = nil
         activeMicID = nil
-        if let session = micSession {
-            micSession = nil
+        stateLock.unlock()
+
+        if let session {
             micQueue.async {
                 if session.isRunning {
                     session.stopRunning()
@@ -346,6 +415,13 @@ extension CaptureManager: SCStreamOutput, SCStreamDelegate {
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // Clear active stream state so a subsequent startScreenCapture can recover cleanly
+        stateLock.lock()
+        if self.scStream === stream {
+            self.scStream = nil
+            self.activeDisplayID = nil
+        }
+        stateLock.unlock()
         onCaptureError?("Screen capture stopped: \(error.localizedDescription)")
     }
 }
