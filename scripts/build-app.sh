@@ -26,6 +26,10 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
+if [[ -f "$ROOT_DIR/Resources/AppIcon.icns" ]]; then
+    cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
 cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -35,6 +39,8 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>StreamShadows</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.shadowfetch.streamshadows</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -62,7 +68,10 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.video</string>
 </dict>
+</plist>
 EOF
+
+plutil -lint "$CONTENTS_DIR/Info.plist"
 
 ENTITLEMENTS_FILE="$DIST_DIR/StreamShadows.entitlements"
 cat > "$ENTITLEMENTS_FILE" << 'EOF'
@@ -89,12 +98,13 @@ fi
 
 if [[ -n "$SIGN_IDENTITY" ]]; then
     echo "Signing with identity: $SIGN_IDENTITY"
-    codesign --force --options runtime --entitlements "$ENTITLEMENTS_FILE" --identifier "com.shadowfetch.streamshadows" --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS_FILE" --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 else
     echo "No Apple Development certificate found; falling back to ad-hoc signing."
-    codesign --force --entitlements "$ENTITLEMENTS_FILE" --identifier "com.shadowfetch.streamshadows" --sign - "$APP_BUNDLE"
+    codesign --force --entitlements "$ENTITLEMENTS_FILE" --sign - "$APP_BUNDLE"
 fi
 
 rm -f "$ENTITLEMENTS_FILE"
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 echo "Built $APP_BUNDLE successfully."
