@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="StreamShadows"
 BUILD_CONFIG="${1:-release}"
+BUNDLE_FFMPEG="${2:-}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -28,6 +29,17 @@ chmod +x "$MACOS_DIR/$APP_NAME"
 
 if [[ -f "$ROOT_DIR/Resources/AppIcon.icns" ]]; then
     cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
+if [[ "$BUNDLE_FFMPEG" == "--bundle-ffmpeg" ]]; then
+    FFMPEG_SRC="$(command -v ffmpeg || true)"
+    if [[ -n "$FFMPEG_SRC" && -f "$FFMPEG_SRC" ]]; then
+        echo "Bundling ffmpeg from $FFMPEG_SRC..."
+        cp "$FFMPEG_SRC" "$RESOURCES_DIR/ffmpeg"
+        chmod +x "$RESOURCES_DIR/ffmpeg"
+    else
+        echo "Warning: --bundle-ffmpeg requested but ffmpeg was not found on PATH." >&2
+    fi
 fi
 
 cat > "$CONTENTS_DIR/Info.plist" << 'EOF'

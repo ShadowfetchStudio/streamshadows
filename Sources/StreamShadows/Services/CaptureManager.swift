@@ -12,8 +12,10 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
     private var scStream: SCStream?
     private var availableDisplays: [SCDisplay] = []
+    private var availableWindows: [SCWindow] = []
     private var availableApplications: [SCRunningApplication] = []
     private var activeDisplayID: CGDirectDisplayID?
+    private var activeWindowID: CGWindowID?
     private var activeDisplayWidth: Int = 0
     private var activeDisplayHeight: Int = 0
     private var activeDisplayFPS: Int = 0
@@ -95,6 +97,7 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             stateLock.withLock {
                 self.availableDisplays = content.displays
+                self.availableWindows = content.windows
                 self.availableApplications = content.applications
             }
 
@@ -117,6 +120,31 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
                 return screenDisplays
             }
             throw error
+        }
+    }
+
+    public func listShareableWindows() -> [WindowOption] {
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let windows = stateLock.withLock { availableWindows }
+        return windows.compactMap { win in
+            guard win.isOnScreen,
+                  win.windowLayer == 0,
+                  win.frame.width >= 200,
+                  win.frame.height >= 120,
+                  let app = win.owningApplication,
+                  app.processID != myPID else {
+                return nil
+            }
+            let appName = app.applicationName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !appName.isEmpty else { return nil }
+            let title = (win.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return WindowOption(
+                id: win.windowID,
+                appName: appName,
+                title: title,
+                width: Int(win.frame.width),
+                height: Int(win.frame.height)
+            )
         }
     }
 
@@ -153,6 +181,7 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     public func startScreenCapture(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, excludeSelf: Bool) async throws {
         let alreadyMatching = stateLock.withLock {
             scStream != nil
+                && activeWindowID == nil
                 && activeDisplayID == displayID
                 && activeDisplayWidth == width
                 && activeDisplayHeight == height
@@ -222,10 +251,73 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         stateLock.withLock {
             self.scStream = stream
             self.activeDisplayID = targetDisplay.displayID
+            self.activeWindowID = nil
             self.activeDisplayWidth = width
             self.activeDisplayHeight = height
             self.activeDisplayFPS = fps
             self.activeExcludeSelf = excludeSelf
+        }
+    }
+
+    /// Captures a single application window via ScreenCaptureKit.
+    public func startWindowCapture(windowID: CGWindowID, width: Int, height: Int, fps: Int) async throws {
+        let alreadyMatching = stateLock.withLock {
+            scStream != nil
+                && activeWindowID == windowID
+                && activeDisplayWidth == width
+                && activeDisplayHeight == height
+                && activeDisplayFPS == fps
+        }
+        if alreadyMatching { return }
+
+        await stopScreenCapture()
+
+        let needsRefresh = stateLock.withLock {
+            !availableWindows.contains(where: { $0.windowID == windowID })
+        }
+        if needsRefresh {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            stateLock.withLock {
+                self.availableDisplays = content.displays
+                self.availableWindows = content.windows
+                self.availableApplications = content.applications
+            }
+        }
+
+        let targetWindow = stateLock.withLock {
+            availableWindows.first(where: { $0.windowID == windowID })
+        }
+        guard let targetWindow else {
+            throw NSError(domain: "StreamShadows", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "Selected window is no longer available."
+            ])
+        }
+
+        let filter = SCContentFilter(desktopIndependentWindow: targetWindow)
+        let config = SCStreamConfiguration()
+        config.width = width
+        config.height = height
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = true
+        config.queueDepth = 5
+        config.capturesAudio = true
+        config.sampleRate = 48_000
+        config.channelCount = 2
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenVideoQueue)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: screenAudioQueue)
+
+        try await stream.startCapture()
+
+        stateLock.withLock {
+            self.scStream = stream
+            self.activeDisplayID = nil
+            self.activeWindowID = targetWindow.windowID
+            self.activeDisplayWidth = width
+            self.activeDisplayHeight = height
+            self.activeDisplayFPS = fps
         }
     }
 
@@ -234,6 +326,7 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
             let current = scStream
             scStream = nil
             activeDisplayID = nil
+            activeWindowID = nil
             return current
         }
 
@@ -261,7 +354,9 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
         let session = AVCaptureSession()
         session.beginConfiguration()
-        if session.canSetSessionPreset(.hd1280x720) {
+        if session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
+        } else if session.canSetSessionPreset(.hd1280x720) {
             session.sessionPreset = .hd1280x720
         }
 
@@ -415,13 +510,13 @@ extension CaptureManager: SCStreamOutput, SCStreamDelegate {
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        // Clear active stream state so a subsequent startScreenCapture can recover cleanly
-        stateLock.lock()
-        if self.scStream === stream {
-            self.scStream = nil
-            self.activeDisplayID = nil
+        stateLock.withLock {
+            if self.scStream === stream {
+                self.scStream = nil
+                self.activeDisplayID = nil
+                self.activeWindowID = nil
+            }
         }
-        stateLock.unlock()
         onCaptureError?("Screen capture stopped: \(error.localizedDescription)")
     }
 }

@@ -10,6 +10,10 @@ public struct AudioMixerSettings: Sendable {
     public var micAudioEnabled: Bool = true
     public var micAudioMuted: Bool = false
     public var micAudioVolume: Float = 1.0
+    /// Linear peak threshold (0.0 = off, up to 0.15) below which mic audio is smoothly gated.
+    public var micNoiseGateThreshold: Float = 0.0
+    /// Sync delay applied to microphone audio (0...300 ms) to align with higher-latency cameras.
+    public var micDelayMs: Int = 0
 
     public var masterMuted: Bool = false
     public var masterVolume: Float = 1.0
@@ -82,6 +86,9 @@ public final class AudioMixer: @unchecked Sendable {
     // Interleaved stereo Float32 ring buffers (max ~0.5s = 48000 floats)
     private var systemBuffer = FloatRingBuffer(capacity: 48_000)
     private var micBuffer = FloatRingBuffer(capacity: 48_000)
+    private var micDelayLine = FloatRingBuffer(capacity: 48_000)
+    private var lastMicDelayMs: Int = 0
+    private var micGateGain: Float = 1.0
 
     private var currentSystemPeak: Float = 0
     private var currentMicPeak: Float = 0
@@ -236,7 +243,7 @@ public final class AudioMixer: @unchecked Sendable {
 
             let (pcmData, masterPeak) = Self.mixToInt16PCM(
                 systemSamples: sysChunk,
-                micSamples: micChunk,
+                micSamples: applyMicProcessing(micChunk, delayMs: cfg.micDelayMs, gateThreshold: cfg.micNoiseGateThreshold),
                 systemGain: sysGain,
                 micGain: micGain,
                 masterGain: masterGain
@@ -258,6 +265,58 @@ public final class AudioMixer: @unchecked Sendable {
             micPeak: latestMicPeak,
             masterPeak: latestMasterPeak
         ))
+    }
+
+    private func applyMicProcessing(_ samples: [Float], delayMs: Int, gateThreshold: Float) -> [Float] {
+        // 1. Apply optional lip-sync delay (0...300ms)
+        let clampedDelay = max(0, min(300, delayMs))
+        let delayed: [Float]
+        if clampedDelay > 0 {
+            let delaySamples = (clampedDelay * Int(Self.sampleRate) / 1000) * Self.channels
+            if lastMicDelayMs != clampedDelay {
+                micDelayLine.clear()
+                micDelayLine.push([Float](repeating: 0, count: delaySamples))
+                lastMicDelayMs = clampedDelay
+            }
+            micDelayLine.push(samples)
+            delayed = micDelayLine.pop(count: samples.count)
+        } else {
+            if lastMicDelayMs != 0 {
+                micDelayLine.clear()
+                lastMicDelayMs = 0
+            }
+            delayed = samples
+        }
+
+        // 2. Apply optional noise gate with smooth attack/release
+        guard gateThreshold > 0.0001 else {
+            micGateGain = 1.0
+            return delayed
+        }
+        return Self.applyNoiseGate(delayed, threshold: gateThreshold, currentGain: &micGateGain)
+    }
+
+    public static func applyNoiseGate(_ samples: [Float], threshold: Float, currentGain: inout Float) -> [Float] {
+        guard threshold > 0 else { return samples }
+        var peak: Float = 0
+        for s in samples {
+            let v = abs(s)
+            if v > peak { peak = v }
+        }
+        let targetGain: Float = peak >= threshold ? 1.0 : 0.0
+        // Fast attack (open immediately), smooth release (~120ms across 20ms chunks)
+        let alpha: Float = targetGain > currentGain ? 0.85 : 0.25
+        var out = [Float](repeating: 0, count: samples.count)
+        let startGain = currentGain
+        let endGain = currentGain + (targetGain - currentGain) * alpha
+        currentGain = endGain
+
+        let denom = Float(max(1, samples.count - 1))
+        for i in 0..<samples.count {
+            let g = startGain + (endGain - startGain) * (Float(i) / denom)
+            out[i] = samples[i] * g
+        }
+        return out
     }
 
     /// Mixes two equal-length stereo Float32 buffers with soft-clipping and converts to interleaved s16le PCM.

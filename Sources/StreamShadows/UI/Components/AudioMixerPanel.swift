@@ -2,15 +2,29 @@ import SwiftUI
 
 struct AudioMixerPanel: View {
     @ObservedObject var viewModel: StreamViewModel
+    @State private var showMicProcessingPopover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 8) {
                 Label("Audio Mixer", systemImage: "slider.horizontal.3")
                     .font(.headline)
                     .foregroundStyle(.primary)
 
                 Spacer()
+
+                Button {
+                    showMicProcessingPopover.toggle()
+                } label: {
+                    Label(micFXLabel, systemImage: "waveform.badge.mic")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .popover(isPresented: $showMicProcessingPopover, arrowEdge: .top) {
+                    micProcessingPopover
+                }
+                .help("Microphone Noise Gate & Lip-Sync Delay")
 
                 if !viewModel.microphones.isEmpty {
                     Picker("Microphone", selection: Binding(
@@ -22,7 +36,7 @@ struct AudioMixerPanel: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    .frame(maxWidth: 220)
+                    .frame(maxWidth: 210)
                     .labelsHidden()
                     .help("Select Microphone Input")
                 }
@@ -31,35 +45,41 @@ struct AudioMixerPanel: View {
             HStack(spacing: 12) {
                 mixerStrip(
                     title: "Desktop Sound",
+                    subtitle: viewModel.sourceMode.usesScreen ? nil : "Screen mode only",
                     icon: "speaker.wave.2.fill",
                     isEnabled: $viewModel.systemAudioEnabled,
                     isMuted: $viewModel.systemAudioMuted,
                     volume: $viewModel.systemAudioVolume,
                     maxVolume: 1.5,
-                    peak: viewModel.audioLevels.systemPeak,
-                    showEnableToggle: true
+                    peak: viewModel.sourceMode.usesScreen ? viewModel.audioLevels.systemPeak : 0,
+                    showEnableToggle: true,
+                    isUnavailable: !viewModel.sourceMode.usesScreen
                 )
 
                 mixerStrip(
                     title: "Microphone",
+                    subtitle: nil,
                     icon: "mic.fill",
                     isEnabled: $viewModel.micAudioEnabled,
                     isMuted: $viewModel.micAudioMuted,
                     volume: $viewModel.micAudioVolume,
                     maxVolume: 2.0,
                     peak: viewModel.audioLevels.micPeak,
-                    showEnableToggle: true
+                    showEnableToggle: true,
+                    isUnavailable: false
                 )
 
                 mixerStrip(
                     title: "Master Output",
+                    subtitle: nil,
                     icon: "waveform",
                     isEnabled: .constant(true),
                     isMuted: $viewModel.masterMuted,
                     volume: $viewModel.masterVolume,
                     maxVolume: 1.5,
                     peak: viewModel.audioLevels.masterPeak,
-                    showEnableToggle: false
+                    showEnableToggle: false,
+                    isUnavailable: false
                 )
             }
         }
@@ -74,22 +94,88 @@ struct AudioMixerPanel: View {
         )
     }
 
+    private var micFXLabel: String {
+        let gateOn = viewModel.micNoiseGateThreshold > 0.001
+        let delayOn = viewModel.micDelayMs > 0
+        if gateOn && delayOn { return "Mic FX • Gate + \(viewModel.micDelayMs)ms" }
+        if gateOn { return "Mic FX • Gate" }
+        if delayOn { return "Mic FX • \(viewModel.micDelayMs)ms" }
+        return "Mic FX"
+    }
+
+    private var micProcessingPopover: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Microphone Processing")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Noise Gate")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(viewModel.micNoiseGateThreshold < 0.001 ? "Off" : "\(Int((viewModel.micNoiseGateThreshold * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(
+                    value: Binding(
+                        get: { Double(viewModel.micNoiseGateThreshold) },
+                        set: { viewModel.micNoiseGateThreshold = Float($0) }
+                    ),
+                    in: 0...0.15
+                )
+                Text("Silences background fan or keyboard noise when you aren't speaking.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Mic Sync Delay")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text("\(viewModel.micDelayMs) ms")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(
+                    value: Binding(
+                        get: { Double(viewModel.micDelayMs) },
+                        set: { viewModel.micDelayMs = Int($0.rounded()) }
+                    ),
+                    in: 0...300,
+                    step: 10
+                )
+                Text("Delay your mic to match higher-latency USB webcams.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+
     @ViewBuilder
     private func mixerStrip(
         title: String,
+        subtitle: String?,
         icon: String,
         isEnabled: Binding<Bool>,
         isMuted: Binding<Bool>,
         volume: Binding<Float>,
         maxVolume: Float,
         peak: Float,
-        showEnableToggle: Bool
+        showEnableToggle: Bool,
+        isUnavailable: Bool
     ) -> some View {
+        let effectivelyActive = isEnabled.wrappedValue && !isUnavailable
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.caption)
-                    .foregroundStyle(isEnabled.wrappedValue && !isMuted.wrappedValue ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(effectivelyActive && !isMuted.wrappedValue ? Color.accentColor : Color.secondary)
 
                 Text(title)
                     .font(.subheadline.weight(.semibold))
@@ -97,7 +183,12 @@ struct AudioMixerPanel: View {
 
                 Spacer()
 
-                if showEnableToggle {
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else if showEnableToggle {
                     Toggle("", isOn: isEnabled)
                         .toggleStyle(.switch)
                         .controlSize(.mini)
@@ -105,7 +196,7 @@ struct AudioMixerPanel: View {
                 }
             }
 
-            LevelMeterView(level: peak, isMuted: !isEnabled.wrappedValue || isMuted.wrappedValue)
+            LevelMeterView(level: peak, isMuted: !effectivelyActive || isMuted.wrappedValue)
 
             HStack(spacing: 8) {
                 Button {
@@ -121,6 +212,7 @@ struct AudioMixerPanel: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .disabled(isUnavailable)
                 .help(isMuted.wrappedValue ? "Unmute \(title)" : "Mute \(title)")
 
                 Slider(
@@ -130,7 +222,7 @@ struct AudioMixerPanel: View {
                     ),
                     in: 0...Double(maxVolume)
                 )
-                .disabled(!isEnabled.wrappedValue)
+                .disabled(!effectivelyActive)
 
                 Text("\(Int((volume.wrappedValue * 100).rounded()))%")
                     .font(.caption.monospacedDigit())
@@ -143,6 +235,6 @@ struct AudioMixerPanel: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color.black.opacity(0.22))
         )
-        .opacity(isEnabled.wrappedValue ? 1.0 : 0.55)
+        .opacity(effectivelyActive ? 1.0 : 0.5)
     }
 }

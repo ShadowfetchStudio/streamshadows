@@ -217,4 +217,28 @@ final class StreamShadowsTests: XCTestCase {
         XCTAssertTrue(mkvArgs.contains("libx264"))
         XCTAssertFalse(mkvArgs.contains("-movflags"))
     }
+
+    func testNoiseGateAttenuatesQuietNoiseAndPassesSpeech() {
+        var gain: Float = 1.0
+        let quietNoise: [Float] = [0.005, -0.004, 0.003, -0.002]
+        // Run several chunks below threshold so gate closes
+        var output = quietNoise
+        for _ in 0..<20 {
+            output = AudioMixer.applyNoiseGate(quietNoise, threshold: 0.05, currentGain: &gain)
+        }
+        XCTAssertLessThan(gain, 0.05)
+        XCTAssertLessThan(abs(output.last ?? 1.0), 0.001)
+
+        // Loud speech above threshold should open gate quickly
+        let speech: [Float] = [0.4, -0.4, 0.5, -0.5]
+        _ = AudioMixer.applyNoiseGate(speech, threshold: 0.05, currentGain: &gain)
+        XCTAssertGreaterThan(gain, 0.8)
+    }
+
+    func testMeaningfulErrorLineDetection() {
+        XCTAssertTrue(RTMPStreamer.isMeaningfulErrorLine("rtmps://a.rtmps.youtube.com/live2/••••: Connection refused"))
+        XCTAssertTrue(RTMPStreamer.isMeaningfulErrorLine("Server returned 403 Forbidden (access denied)"))
+        XCTAssertTrue(RTMPStreamer.isMeaningfulErrorLine("No space left on device"))
+        XCTAssertFalse(RTMPStreamer.isMeaningfulErrorLine("Stream #0:0: Video: h264"))
+    }
 }

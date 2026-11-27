@@ -61,13 +61,18 @@ struct InspectorSidebar: View {
                 .labelsHidden()
             }
 
-            // Screen selection
+            // Screen or Single Window selection
             if viewModel.sourceMode.usesScreen {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Label("Select Screen (\(viewModel.displays.count))", systemImage: "display.2")
-                                .font(.subheadline.weight(.semibold))
+                            Label(
+                                viewModel.screenTargetMode == .display
+                                    ? "Select Screen (\(viewModel.displays.count))"
+                                    : "Select Window (\(viewModel.windows.count))",
+                                systemImage: viewModel.screenTargetMode == .display ? "display.2" : "macwindow"
+                            )
+                            .font(.subheadline.weight(.semibold))
                             Spacer()
                             Button {
                                 Task { await viewModel.refreshAllDevices() }
@@ -75,55 +80,81 @@ struct InspectorSidebar: View {
                                 Image(systemName: "arrow.clockwise")
                             }
                             .buttonStyle(.borderless)
-                            .help("Refresh Displays & Devices")
+                            .help("Refresh Displays, Windows & Devices")
                         }
 
-                        if viewModel.displays.isEmpty {
-                            Text("No displays detected.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            VStack(spacing: 6) {
-                                ForEach(viewModel.displays) { display in
-                                    let isSelected = display.id == viewModel.selectedDisplayID
-                                    Button {
-                                        viewModel.selectDisplay(display.id)
-                                    } label: {
-                                        HStack(spacing: 10) {
-                                            Image(systemName: "display")
-                                                .font(.body)
-                                                .foregroundStyle(isSelected ? Color.white : Color.secondary)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(display.name)
-                                                    .font(.callout.weight(isSelected ? .semibold : .regular))
-                                                    .foregroundStyle(isSelected ? .white : .primary)
-                                                    .lineLimit(1)
-                                                Text(display.resolutionLabel)
-                                                    .font(.caption2.monospacedDigit())
-                                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
-                                            }
-                                            Spacer()
-                                            if isSelected {
-                                                Image(systemName: "checkmark.circle.fill")
-                                                    .foregroundStyle(.white)
-                                            }
-                                        }
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 8)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(isSelected ? Color.purple : Color.white.opacity(0.06))
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                }
+                        Picker("Capture Target", selection: $viewModel.screenTargetMode) {
+                            ForEach(ScreenCaptureTargetMode.allCases) { target in
+                                Text(target.title).tag(target)
                             }
                         }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
 
-                        Toggle("Hide StreamShadows from capture", isOn: $viewModel.excludeSelfFromCapture)
-                            .font(.callout)
-                            .help("Prevents infinite preview recursion when streaming the same screen StreamShadows is on")
+                        if viewModel.screenTargetMode == .display {
+                            if viewModel.displays.isEmpty {
+                                Text("No displays detected.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                VStack(spacing: 6) {
+                                    ForEach(viewModel.displays) { display in
+                                        let isSelected = display.id == viewModel.selectedDisplayID
+                                        Button {
+                                            viewModel.selectDisplay(display.id)
+                                        } label: {
+                                            HStack(spacing: 10) {
+                                                Image(systemName: "display")
+                                                    .font(.body)
+                                                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(display.name)
+                                                        .font(.callout.weight(isSelected ? .semibold : .regular))
+                                                        .foregroundStyle(isSelected ? .white : .primary)
+                                                        .lineLimit(1)
+                                                    Text(display.resolutionLabel)
+                                                        .font(.caption2.monospacedDigit())
+                                                        .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
+                                                }
+                                                Spacer()
+                                                if isSelected {
+                                                    Image(systemName: "checkmark.circle.fill")
+                                                        .foregroundStyle(.white)
+                                                }
+                                            }
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 8)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .fill(isSelected ? Color.purple : Color.white.opacity(0.06))
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+
+                            Toggle("Hide StreamShadows from capture", isOn: $viewModel.excludeSelfFromCapture)
+                                .font(.callout)
+                                .help("Prevents infinite preview recursion when streaming the same screen StreamShadows is on")
+                        } else {
+                            if viewModel.windows.isEmpty {
+                                Text("No shareable windows found. Click refresh or grant Screen Recording access.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Picker("Window", selection: Binding(
+                                    get: { viewModel.selectedWindowID ?? viewModel.windows.first?.id ?? 0 },
+                                    set: { viewModel.selectWindow($0) }
+                                )) {
+                                    ForEach(viewModel.windows) { win in
+                                        Text(win.displayLabel).tag(win.id)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                        }
 
                         if !viewModel.hasScreenPermission {
                             Button("Grant Screen Recording Access") {
@@ -180,6 +211,13 @@ struct InspectorSidebar: View {
                                 Picker("Size", selection: $viewModel.pipSize) {
                                     ForEach(PiPSize.allCases) { size in
                                         Text(size.title).tag(size)
+                                    }
+                                }
+                                .pickerStyle(.segmented)
+
+                                Picker("Shape", selection: $viewModel.pipShape) {
+                                    ForEach(PiPShape.allCases) { shape in
+                                        Text(shape.title).tag(shape)
                                     }
                                 }
                                 .pickerStyle(.segmented)
@@ -424,6 +462,10 @@ struct InspectorSidebar: View {
                     }
                     .labelsHidden()
                     .disabled(viewModel.isEncodingActive)
+
+                    Toggle("Auto-reconnect on stream drop", isOn: $viewModel.autoReconnectEnabled)
+                        .font(.callout)
+                        .padding(.top, 4)
                 }
                 .padding(4)
             }
@@ -434,10 +476,10 @@ struct InspectorSidebar: View {
                         Label("Local Recording", systemImage: "record.circle")
                             .font(.subheadline.weight(.semibold))
                         Spacer()
-                        if viewModel.recordingState.isRecording {
+                        if viewModel.recordingState.isRecording || viewModel.recordingState.isPaused {
                             Text(viewModel.recordingElapsedText)
                                 .font(.caption.monospacedDigit())
-                                .foregroundStyle(.red)
+                                .foregroundStyle(viewModel.recordingState.isPaused ? .orange : .red)
                         }
                     }
 
@@ -448,8 +490,14 @@ struct InspectorSidebar: View {
                     }
                     .disabled(viewModel.recordingState.isActive)
 
+                    Toggle("Ask where to save when clicking Record", isOn: $viewModel.askRecordingLocationOnRecord)
+                        .font(.callout)
+
+                    Toggle("3-second countdown before recording", isOn: $viewModel.recordingCountdownEnabled)
+                        .font(.callout)
+
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Save Folder")
+                        Text("Default Folder")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                         Text(viewModel.recordingDirectoryPath)

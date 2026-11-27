@@ -3,12 +3,16 @@ import SwiftUI
 import AppKit
 import CoreGraphics
 import AVFoundation
+import UniformTypeIdentifiers
 
 @MainActor
 public final class StreamViewModel: ObservableObject {
     // MARK: - Devices & Permissions
     @Published public var displays: [DisplayOption] = []
     @Published public var selectedDisplayID: CGDirectDisplayID?
+
+    @Published public var windows: [WindowOption] = []
+    @Published public var selectedWindowID: CGWindowID?
 
     @Published public var cameras: [CaptureDeviceOption] = []
     @Published public var selectedCameraID: String?
@@ -29,6 +33,13 @@ public final class StreamViewModel: ObservableObject {
         }
     }
 
+    @Published public var screenTargetMode: ScreenCaptureTargetMode = .display {
+        didSet {
+            savePreferences()
+            Task { await reconfigureScreenCapture() }
+        }
+    }
+
     @Published public var pipPosition: PiPPosition = .bottomRight {
         didSet {
             savePreferences()
@@ -37,6 +48,13 @@ public final class StreamViewModel: ObservableObject {
     }
 
     @Published public var pipSize: PiPSize = .medium {
+        didSet {
+            savePreferences()
+            updateCompositorConfig()
+        }
+    }
+
+    @Published public var pipShape: PiPShape = .rounded {
         didSet {
             savePreferences()
             updateCompositorConfig()
@@ -90,6 +108,18 @@ public final class StreamViewModel: ObservableObject {
             pushAudioMixerSettings()
         }
     }
+    @Published public var micNoiseGateThreshold: Float = 0.0 {
+        didSet {
+            savePreferences()
+            pushAudioMixerSettings()
+        }
+    }
+    @Published public var micDelayMs: Int = 0 {
+        didSet {
+            savePreferences()
+            pushAudioMixerSettings()
+        }
+    }
 
     @Published public var masterMuted: Bool = false {
         didSet { pushAudioMixerSettings() }
@@ -119,6 +149,10 @@ public final class StreamViewModel: ObservableObject {
         didSet { savePreferences() }
     }
 
+    @Published public var autoReconnectEnabled: Bool = true {
+        didSet { savePreferences() }
+    }
+
     @Published public var customFFmpegPath: String = "" {
         didSet {
             savePreferences()
@@ -135,8 +169,16 @@ public final class StreamViewModel: ObservableObject {
     @Published public var recordingDirectoryPath: String = LocalRecorder.defaultRecordingsDirectory().path {
         didSet { savePreferences() }
     }
+    /// When enabled (default), clicking Record prompts with a native Save dialog to pick exact location & filename.
+    @Published public var askRecordingLocationOnRecord: Bool = true {
+        didSet { savePreferences() }
+    }
+    @Published public var recordingCountdownEnabled: Bool = false {
+        didSet { savePreferences() }
+    }
     @Published public var recordingState: RecordingState = .idle
     @Published public var recordingElapsedText: String = "00:00:00"
+    @Published public var recordingFileSizeText: String = ""
     @Published public var lastRecordingURL: URL?
 
     // MARK: - Live State
@@ -159,13 +201,24 @@ public final class StreamViewModel: ObservableObject {
 
     private var uptimeTimer: Timer?
     private var recordingTimer: Timer?
+    private var recordingAccumulatedSeconds: TimeInterval = 0
+    private var recordingSegmentStartDate: Date?
+    private var activeRecordingURL: URL?
+    private var countdownTask: Task<Void, Never>?
+
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempt: Int = 0
+    private let maxReconnectAttempts: Int = 5
+    private var userRequestedStreamStop: Bool = false
+
     private var isBootstrapped = false
+    private var isPreviewWindowHidden = false
     private var isRequestingMicPermission = false
     private var hasAutoPromptedMic = false
     private var isRequestingCameraPermission = false
     private var hasAutoPromptedCamera = false
     private var notificationObservers: [NSObjectProtocol] = []
-    private var keychainSaveTasks: [StreamingPlatform: Task<Void, Never>] = [:]
+    private var destinationSaveTasks: [StreamingPlatform: Task<Void, Never>] = [:]
 
     public init() {
         loadPreferences()
@@ -201,7 +254,6 @@ public final class StreamViewModel: ObservableObject {
         guard !isBootstrapped else { return }
         isBootstrapped = true
 
-        // Populate connected screens synchronously via NSScreen so they appear immediately
         displays = CaptureManager.listConnectedDisplays()
         if selectedDisplayID == nil || !displays.contains(where: { $0.id == selectedDisplayID }) {
             selectedDisplayID = displays.first?.id
@@ -228,6 +280,8 @@ public final class StreamViewModel: ObservableObject {
             ) { [weak self] _ in
                 Task { @MainActor in
                     guard let self else { return }
+                    self.isPreviewWindowHidden = false
+                    self.updateCompositorConfig()
                     let hadScreen = self.hasScreenPermission
                     self.refreshPermissionStatus()
                     if !hadScreen && self.hasScreenPermission {
@@ -237,6 +291,28 @@ public final class StreamViewModel: ObservableObject {
                 }
             }
         )
+
+        // Idle GPU/battery pause when minimized or hidden
+        for hideName in [NSWindow.didMiniaturizeNotification, NSApplication.didHideNotification] {
+            notificationObservers.append(
+                nc.addObserver(forName: hideName, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.isPreviewWindowHidden = true
+                        self?.updateCompositorConfig()
+                    }
+                }
+            )
+        }
+        for showName in [NSWindow.didDeminiaturizeNotification, NSApplication.didUnhideNotification] {
+            notificationObservers.append(
+                nc.addObserver(forName: showName, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.isPreviewWindowHidden = false
+                        self?.updateCompositorConfig()
+                    }
+                }
+            )
+        }
 
         // Hot-plug camera & microphone detection
         for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
@@ -255,6 +331,10 @@ public final class StreamViewModel: ObservableObject {
         refreshPermissionStatus()
         await refreshAllDevices()
 
+        if detectedFFmpegPath == nil {
+            statusBanner = "FFmpeg not found. Install via `brew install ffmpeg` or set its path in the Output tab to enable streaming and recording."
+        }
+
         updateCompositorConfig()
         pushAudioMixerSettings()
 
@@ -263,8 +343,11 @@ public final class StreamViewModel: ObservableObject {
         await reconfigureCaptureSources()
     }
 
-    public func shutdown() {
-        flushPendingKeychainSaves()
+    /// Synchronously flushes pending Keychain saves and gracefully finalizes active recordings before app termination.
+    public func shutdownSynchronously() {
+        countdownTask?.cancel()
+        reconnectTask?.cancel()
+        flushPendingDestinationSaves()
         for observer in notificationObservers {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -275,11 +358,33 @@ public final class StreamViewModel: ObservableObject {
         recordingTimer = nil
         sleepPreventer.endPreventingSleep()
         streamer.stop()
-        recorder.stop()
+        if recordingState.isActive {
+            recorder.stopAndWait(timeout: 3.0)
+        } else {
+            recorder.stop()
+        }
         compositor.stop()
         audioMixer.stop()
         Task {
             await captureManager.stopAll()
+        }
+    }
+
+    // MARK: - Banner Dismissal
+
+    public func dismissStatusBanner() {
+        statusBanner = nil
+    }
+
+    public func dismissStreamError() {
+        if case .error = streamState {
+            streamState = .idle
+        }
+    }
+
+    public func dismissRecordingError() {
+        if case .error = recordingState {
+            recordingState = .idle
         }
     }
 
@@ -355,7 +460,6 @@ public final class StreamViewModel: ObservableObject {
             selectedMicID = microphones.first?.id
         }
 
-        // Always update displays via NSScreen first
         let physicalDisplays = CaptureManager.listConnectedDisplays()
         if !physicalDisplays.isEmpty {
             displays = physicalDisplays
@@ -372,6 +476,10 @@ public final class StreamViewModel: ObservableObject {
                     selectedDisplayID = foundDisplays.first?.id
                 }
             }
+            windows = captureManager.listShareableWindows()
+            if selectedWindowID == nil || !windows.contains(where: { $0.id == selectedWindowID }) {
+                selectedWindowID = windows.first?.id
+            }
             hasScreenPermission = CaptureManager.hasScreenCapturePermission()
         } catch {
             appendLog("Display refresh notice: \(error.localizedDescription)")
@@ -381,6 +489,12 @@ public final class StreamViewModel: ObservableObject {
     public func selectDisplay(_ id: CGDirectDisplayID?) {
         guard selectedDisplayID != id else { return }
         selectedDisplayID = id
+        Task { await reconfigureScreenCapture() }
+    }
+
+    public func selectWindow(_ id: CGWindowID?) {
+        guard selectedWindowID != id else { return }
+        selectedWindowID = id
         Task { await reconfigureScreenCapture() }
     }
 
@@ -406,20 +520,37 @@ public final class StreamViewModel: ObservableObject {
 
     private func reconfigureScreenCapture() async {
         guard isBootstrapped else { return }
-        if sourceMode.usesScreen, let displayID = selectedDisplayID {
+        if sourceMode.usesScreen {
             do {
-                try await captureManager.startScreenCapture(
-                    displayID: displayID,
-                    width: qualityPreset.width,
-                    height: qualityPreset.height,
-                    fps: qualityPreset.fps,
-                    excludeSelf: excludeSelfFromCapture
-                )
+                switch screenTargetMode {
+                case .display:
+                    guard let displayID = selectedDisplayID else { return }
+                    try await captureManager.startScreenCapture(
+                        displayID: displayID,
+                        width: qualityPreset.width,
+                        height: qualityPreset.height,
+                        fps: qualityPreset.fps,
+                        excludeSelf: excludeSelfFromCapture
+                    )
+                case .window:
+                    guard let winID = selectedWindowID else {
+                        await captureManager.stopScreenCapture()
+                        return
+                    }
+                    try await captureManager.startWindowCapture(
+                        windowID: winID,
+                        width: qualityPreset.width,
+                        height: qualityPreset.height,
+                        fps: qualityPreset.fps
+                    )
+                }
                 hasScreenPermission = true
-                statusBanner = nil
+                if detectedFFmpegPath != nil {
+                    statusBanner = nil
+                }
             } catch {
                 appendLog("Screen capture error: \(error.localizedDescription)")
-                statusBanner = "Grant Screen Recording permission in System Settings to capture your display."
+                statusBanner = "Grant Screen Recording permission in System Settings to capture your screen."
             }
         } else {
             await captureManager.stopScreenCapture()
@@ -471,42 +602,33 @@ public final class StreamViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Destination Management
+    // MARK: - Destination Management (Debounced Keychain + UserDefaults)
 
     public func updateDestination(_ updated: StreamDestinationConfig) {
         if let idx = destinations.firstIndex(where: { $0.platform == updated.platform }) {
+            let platform = updated.platform
             let keyChanged = destinations[idx].streamKey != updated.streamKey
+            let enabledChanged = destinations[idx].isEnabled != updated.isEnabled
             destinations[idx] = updated
-            savePreferences()
 
-            if keyChanged {
-                let platform = updated.platform
-                let key = updated.streamKey
-                keychainSaveTasks[platform]?.cancel()
-                keychainSaveTasks[platform] = Task { [weak self] in
-                    try? await Task.sleep(for: .milliseconds(400))
-                    guard !Task.isCancelled, let self else { return }
-                    let status = self.keychain.saveStreamKey(key, for: platform)
+            if enabledChanged {
+                savePreferences()
+            }
+
+            destinationSaveTasks[platform]?.cancel()
+            destinationSaveTasks[platform] = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard !Task.isCancelled, let self else { return }
+                self.savePreferences()
+                if keyChanged {
+                    let status = self.keychain.saveStreamKey(updated.streamKey, for: platform)
                     if status != errSecSuccess && status != errSecItemNotFound {
                         self.appendLog("Keychain save warning for \(platform.displayName): OSStatus \(status)")
                     }
-                    self.keychainSaveTasks.removeValue(forKey: platform)
                 }
+                self.destinationSaveTasks.removeValue(forKey: platform)
             }
         }
-    }
-
-    private func flushPendingKeychainSaves() {
-        for (platform, task) in keychainSaveTasks {
-            task.cancel()
-            if let dest = destinations.first(where: { $0.platform == platform }) {
-                let status = keychain.saveStreamKey(dest.streamKey, for: platform)
-                if status != errSecSuccess && status != errSecItemNotFound {
-                    appendLog("Keychain save warning for \(platform.displayName): OSStatus \(status)")
-                }
-            }
-        }
-        keychainSaveTasks.removeAll()
     }
 
     public func resetIngestURL(for platform: StreamingPlatform) {
@@ -516,7 +638,22 @@ public final class StreamViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Streaming Control
+    private func flushPendingDestinationSaves() {
+        guard !destinationSaveTasks.isEmpty else { return }
+        for (platform, task) in destinationSaveTasks {
+            task.cancel()
+            if let dest = destinations.first(where: { $0.platform == platform }) {
+                let status = keychain.saveStreamKey(dest.streamKey, for: platform)
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    appendLog("Keychain save warning for \(platform.displayName): OSStatus \(status)")
+                }
+            }
+        }
+        destinationSaveTasks.removeAll()
+        savePreferences()
+    }
+
+    // MARK: - Streaming Control (with Auto-Reconnect)
 
     public func toggleStream() {
         if streamState.isActive {
@@ -528,7 +665,7 @@ public final class StreamViewModel: ObservableObject {
 
     public func startStream() {
         guard !streamState.isActive else { return }
-        flushPendingKeychainSaves()
+        flushPendingDestinationSaves()
 
         guard detectedFFmpegPath != nil else {
             streamState = .error(RTMPStreamerError.ffmpegNotFound.localizedDescription)
@@ -540,10 +677,17 @@ public final class StreamViewModel: ObservableObject {
             return
         }
 
+        userRequestedStreamStop = false
+        reconnectAttempt = 0
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        launchStreamerProcess()
+    }
+
+    private func launchStreamerProcess() {
         streamState = .starting
         telemetry = StreamTelemetry()
         elapsedTimeText = "00:00:00"
-        statusBanner = nil
 
         do {
             try streamer.start(
@@ -566,6 +710,19 @@ public final class StreamViewModel: ObservableObject {
 
     public func stopStream() {
         guard streamState.isActive else { return }
+        userRequestedStreamStop = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
+
+        if case .reconnecting = streamState {
+            streamState = .idle
+            updateSleepAssertion()
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+            appendLog("Cancelled auto-reconnect.")
+            return
+        }
+
         streamState = .stopping
         uptimeTimer?.invalidate()
         uptimeTimer = nil
@@ -576,7 +733,31 @@ public final class StreamViewModel: ObservableObject {
         appendLog("Stopping stream…")
     }
 
-    // MARK: - Recording Control
+    private func scheduleReconnect(lastError: String) {
+        reconnectAttempt += 1
+        guard reconnectAttempt <= maxReconnectAttempts else {
+            streamState = .error("\(lastError) (Auto-reconnect exhausted after \(maxReconnectAttempts) attempts.)")
+            updateSleepAssertion()
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+            return
+        }
+
+        let delaySeconds = min(15, Int(pow(2.0, Double(reconnectAttempt - 1))) * 2)
+        streamState = .reconnecting(attempt: reconnectAttempt, maxAttempts: maxReconnectAttempts)
+        appendLog("Connection lost (\(lastError)). Reconnecting in \(delaySeconds)s (attempt \(reconnectAttempt)/\(maxReconnectAttempts))…")
+        updateCompositorConfig()
+        pushAudioMixerSettings()
+
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            guard !Task.isCancelled, let self, !self.userRequestedStreamStop else { return }
+            self.launchStreamerProcess()
+        }
+    }
+
+    // MARK: - Recording Control (On-Click Save Panel + Countdown + Pause/Resume)
 
     public func toggleRecording() {
         if recordingState.isActive {
@@ -594,24 +775,83 @@ public final class StreamViewModel: ObservableObject {
             return
         }
 
+        let chosenURL: URL
+        if askRecordingLocationOnRecord {
+            guard let picked = promptForRecordingSaveLocation() else {
+                // User cancelled Save dialog
+                return
+            }
+            chosenURL = picked
+            recordingDirectoryPath = picked.deletingLastPathComponent().path
+        } else {
+            let folderURL = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+            chosenURL = LocalRecorder.makeRecordingURL(in: folderURL, format: recordingFormat)
+        }
+
+        if recordingCountdownEnabled {
+            beginRecordingCountdown(to: chosenURL)
+        } else {
+            beginRecordingImmediately(to: chosenURL)
+        }
+    }
+
+    private func promptForRecordingSaveLocation() -> URL? {
+        let panel = NSSavePanel()
+        panel.title = "Save Recording As"
+        panel.prompt = "Start Recording"
+        panel.canCreateDirectories = true
+
+        let defaultDir = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: defaultDir, withIntermediateDirectories: true)
+        panel.directoryURL = defaultDir
+
+        let suggested = LocalRecorder.makeRecordingURL(in: defaultDir, format: recordingFormat)
+        panel.nameFieldStringValue = suggested.lastPathComponent
+        if let utType = UTType(filenameExtension: recordingFormat.fileExtension) {
+            panel.allowedContentTypes = [utType]
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func beginRecordingCountdown(to fileURL: URL) {
+        countdownTask?.cancel()
+        recordingState = .countdown(remaining: 3, fileURL: fileURL)
+        countdownTask = Task { [weak self] in
+            for remaining in stride(from: 3, through: 1, by: -1) {
+                guard !Task.isCancelled, let self else { return }
+                self.recordingState = .countdown(remaining: remaining, fileURL: fileURL)
+                try? await Task.sleep(for: .seconds(1))
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.beginRecordingImmediately(to: fileURL)
+        }
+    }
+
+    private func beginRecordingImmediately(to fileURL: URL) {
         recordingElapsedText = "00:00:00"
-        let folderURL = URL(fileURLWithPath: recordingDirectoryPath, isDirectory: true)
+        recordingFileSizeText = "0 MB"
+        recordingAccumulatedSeconds = 0
+        activeRecordingURL = fileURL
 
         do {
-            let fileURL = try recorder.start(
-                directory: folderURL,
+            let savedURL = try recorder.start(
+                outputURL: fileURL,
                 format: recordingFormat,
                 preset: qualityPreset,
                 encoder: encoderPreference,
                 customFFmpegPath: customFFmpegPath
             )
-            let startedAt = Date()
-            recordingState = .recording(startedAt: startedAt, fileURL: fileURL)
-            startRecordingTimer(from: startedAt)
+            let now = Date()
+            recordingSegmentStartDate = now
+            recordingState = .recording(startedAt: now, fileURL: savedURL)
+            startRecordingTimer()
             updateSleepAssertion()
             updateCompositorConfig()
             pushAudioMixerSettings()
         } catch {
+            activeRecordingURL = nil
             recordingState = .error(error.localizedDescription)
             updateSleepAssertion()
             updateCompositorConfig()
@@ -620,11 +860,42 @@ public final class StreamViewModel: ObservableObject {
         }
     }
 
+    public func togglePauseRecording() {
+        switch recordingState {
+        case .recording(let startedAt, let fileURL):
+            recordingAccumulatedSeconds += max(0, Date().timeIntervalSince(startedAt))
+            recordingSegmentStartDate = nil
+            recorder.setPaused(true)
+            recordingState = .paused(accumulated: recordingAccumulatedSeconds, fileURL: fileURL)
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+            appendLog("Recording paused.")
+        case .paused(_, let fileURL):
+            let resumedAt = Date()
+            recordingSegmentStartDate = resumedAt
+            recorder.setPaused(false)
+            recordingState = .recording(startedAt: resumedAt, fileURL: fileURL)
+            updateCompositorConfig()
+            pushAudioMixerSettings()
+            appendLog("Recording resumed.")
+        default:
+            break
+        }
+    }
+
     public func stopRecording() {
         guard recordingState.isActive else { return }
+        if recordingState.isCountdown {
+            countdownTask?.cancel()
+            countdownTask = nil
+            recordingState = .idle
+            return
+        }
+
         recordingState = .stopping
         recordingTimer?.invalidate()
         recordingTimer = nil
+        recordingSegmentStartDate = nil
         updateSleepAssertion()
         updateCompositorConfig()
         pushAudioMixerSettings()
@@ -699,7 +970,6 @@ public final class StreamViewModel: ObservableObject {
             }
         }
         compositor.onEncodedVideoFrame = { [weak streamer, weak recorder] frameBuffer in
-            // Share zero-copy frame across both live streamer and local recorder
             frameBuffer.retain()
             streamer?.writeVideoFrame(frameBuffer)
             recorder?.writeVideoFrame(frameBuffer)
@@ -719,8 +989,8 @@ public final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.telemetry = stats
-                // Transition from CONNECTING (.starting) to LIVE only once FFmpeg confirms frames are being pushed
                 if self.streamState == .starting && stats.framesSent > 0 {
+                    self.reconnectAttempt = 0
                     let startTime = Date()
                     self.streamState = .live(startedAt: startTime)
                     self.startUptimeTimer(from: startTime)
@@ -738,6 +1008,12 @@ public final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.uptimeTimer?.invalidate()
                 self.uptimeTimer = nil
+
+                if let errorMessage, !self.userRequestedStreamStop, self.autoReconnectEnabled {
+                    self.scheduleReconnect(lastError: errorMessage)
+                    return
+                }
+
                 if let errorMessage {
                     self.streamState = .error(errorMessage)
                     self.appendLog(errorMessage)
@@ -761,6 +1037,9 @@ public final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.recordingTimer?.invalidate()
                 self.recordingTimer = nil
+                self.activeRecordingURL = nil
+                self.recordingFileSizeText = ""
+
                 if let errorMessage {
                     self.recordingState = .error(errorMessage)
                     self.appendLog(errorMessage)
@@ -768,7 +1047,7 @@ public final class StreamViewModel: ObservableObject {
                     self.recordingState = .idle
                     if let savedURL, FileManager.default.fileExists(atPath: savedURL.path) {
                         self.lastRecordingURL = savedURL
-                        self.appendLog("Recording saved: \(savedURL.lastPathComponent)")
+                        self.appendLog("Recording saved: \(savedURL.path)")
                     } else {
                         self.appendLog("Recording stopped (exit \(code)).")
                     }
@@ -785,40 +1064,30 @@ public final class StreamViewModel: ObservableObject {
         cfg.mode = sourceMode
         cfg.pipPosition = pipPosition
         cfg.pipSize = pipSize
+        cfg.pipShape = pipShape
         cfg.mirrorCamera = mirrorCamera
         cfg.width = qualityPreset.width
         cfg.height = qualityPreset.height
         cfg.fps = qualityPreset.fps
         cfg.isStreaming = isPipelineProducingFrames
+        cfg.isPreviewPaused = isPreviewWindowHidden && !isPipelineProducingFrames
         compositor.updateConfig(cfg)
     }
 
     private func pushAudioMixerSettings() {
         var s = AudioMixerSettings()
-        s.systemAudioEnabled = systemAudioEnabled
+        s.systemAudioEnabled = systemAudioEnabled && sourceMode.usesScreen
         s.systemAudioMuted = systemAudioMuted
         s.systemAudioVolume = systemAudioVolume
         s.micAudioEnabled = micAudioEnabled
         s.micAudioMuted = micAudioMuted
         s.micAudioVolume = micAudioVolume
+        s.micNoiseGateThreshold = micNoiseGateThreshold
+        s.micDelayMs = micDelayMs
         s.masterMuted = masterMuted
         s.masterVolume = masterVolume
         s.isStreaming = isPipelineProducingFrames
         audioMixer.updateSettings(s)
-    }
-
-    private func startRecordingTimer(from startDate: Date) {
-        recordingTimer?.invalidate()
-        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                let elapsed = max(0, Int(Date().timeIntervalSince(startDate)))
-                let hrs = elapsed / 3600
-                let mins = (elapsed % 3600) / 60
-                let secs = elapsed % 60
-                self.recordingElapsedText = String(format: "%02d:%02d:%02d", hrs, mins, secs)
-            }
-        }
     }
 
     private func startUptimeTimer(from startDate: Date) {
@@ -827,12 +1096,34 @@ public final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 let elapsed = max(0, Int(Date().timeIntervalSince(startDate)))
-                let hrs = elapsed / 3600
-                let mins = (elapsed % 3600) / 60
-                let secs = elapsed % 60
-                self.elapsedTimeText = String(format: "%02d:%02d:%02d", hrs, mins, secs)
+                self.elapsedTimeText = Self.formatDuration(elapsed)
             }
         }
+    }
+
+    private func startRecordingTimer() {
+        recordingTimer?.invalidate()
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let segment = self.recordingSegmentStartDate.map { max(0, Date().timeIntervalSince($0)) } ?? 0
+                let total = Int(self.recordingAccumulatedSeconds + segment)
+                self.recordingElapsedText = Self.formatDuration(total)
+
+                if let url = self.activeRecordingURL,
+                   let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                   let size = attrs[.size] as? NSNumber {
+                    self.recordingFileSizeText = LocalRecorder.formatByteCount(size.int64Value)
+                }
+            }
+        }
+    }
+
+    private static func formatDuration(_ seconds: Int) -> String {
+        let hrs = seconds / 3600
+        let mins = (seconds % 3600) / 60
+        let secs = seconds % 60
+        return String(format: "%02d:%02d:%02d", hrs, mins, secs)
     }
 
     private func appendLog(_ message: String) {
@@ -855,11 +1146,17 @@ public final class StreamViewModel: ObservableObject {
         if let raw = defaults.string(forKey: "sourceMode"), let mode = StreamSourceMode(rawValue: raw) {
             sourceMode = mode
         }
+        if let raw = defaults.string(forKey: "screenTargetMode"), let target = ScreenCaptureTargetMode(rawValue: raw) {
+            screenTargetMode = target
+        }
         if let raw = defaults.string(forKey: "pipPosition"), let pos = PiPPosition(rawValue: raw) {
             pipPosition = pos
         }
         if let raw = defaults.string(forKey: "pipSize"), let sz = PiPSize(rawValue: raw) {
             pipSize = sz
+        }
+        if let raw = defaults.string(forKey: "pipShape"), let shape = PiPShape(rawValue: raw) {
+            pipShape = shape
         }
         if defaults.object(forKey: "mirrorCamera") != nil {
             mirrorCamera = defaults.bool(forKey: "mirrorCamera")
@@ -879,6 +1176,12 @@ public final class StreamViewModel: ObservableObject {
         if defaults.object(forKey: "micAudioVolume") != nil {
             micAudioVolume = defaults.float(forKey: "micAudioVolume")
         }
+        if defaults.object(forKey: "micNoiseGateThreshold") != nil {
+            micNoiseGateThreshold = defaults.float(forKey: "micNoiseGateThreshold")
+        }
+        if defaults.object(forKey: "micDelayMs") != nil {
+            micDelayMs = defaults.integer(forKey: "micDelayMs")
+        }
         if defaults.object(forKey: "masterVolume") != nil {
             masterVolume = defaults.float(forKey: "masterVolume")
         }
@@ -888,12 +1191,21 @@ public final class StreamViewModel: ObservableObject {
         if let raw = defaults.string(forKey: "encoderPreference"), let enc = VideoEncoderPreference(rawValue: raw) {
             encoderPreference = enc
         }
+        if defaults.object(forKey: "autoReconnectEnabled") != nil {
+            autoReconnectEnabled = defaults.bool(forKey: "autoReconnectEnabled")
+        }
         customFFmpegPath = defaults.string(forKey: "customFFmpegPath") ?? ""
         if let raw = defaults.string(forKey: "recordingFormat"), let fmt = RecordingFormat(rawValue: raw) {
             recordingFormat = fmt
         }
         if let savedDir = defaults.string(forKey: "recordingDirectoryPath"), !savedDir.isEmpty {
             recordingDirectoryPath = savedDir
+        }
+        if defaults.object(forKey: "askRecordingLocationOnRecord") != nil {
+            askRecordingLocationOnRecord = defaults.bool(forKey: "askRecordingLocationOnRecord")
+        }
+        if defaults.object(forKey: "recordingCountdownEnabled") != nil {
+            recordingCountdownEnabled = defaults.bool(forKey: "recordingCountdownEnabled")
         }
 
         destinations = StreamingPlatform.allCases.map { platform in
@@ -911,20 +1223,27 @@ public final class StreamViewModel: ObservableObject {
 
     private func savePreferences() {
         defaults.set(sourceMode.rawValue, forKey: "sourceMode")
+        defaults.set(screenTargetMode.rawValue, forKey: "screenTargetMode")
         defaults.set(pipPosition.rawValue, forKey: "pipPosition")
         defaults.set(pipSize.rawValue, forKey: "pipSize")
+        defaults.set(pipShape.rawValue, forKey: "pipShape")
         defaults.set(mirrorCamera, forKey: "mirrorCamera")
         defaults.set(excludeSelfFromCapture, forKey: "excludeSelfFromCapture")
         defaults.set(systemAudioEnabled, forKey: "systemAudioEnabled")
         defaults.set(systemAudioVolume, forKey: "systemAudioVolume")
         defaults.set(micAudioEnabled, forKey: "micAudioEnabled")
         defaults.set(micAudioVolume, forKey: "micAudioVolume")
+        defaults.set(micNoiseGateThreshold, forKey: "micNoiseGateThreshold")
+        defaults.set(micDelayMs, forKey: "micDelayMs")
         defaults.set(masterVolume, forKey: "masterVolume")
         defaults.set(qualityPreset.rawValue, forKey: "qualityPreset")
         defaults.set(encoderPreference.rawValue, forKey: "encoderPreference")
+        defaults.set(autoReconnectEnabled, forKey: "autoReconnectEnabled")
         defaults.set(customFFmpegPath, forKey: "customFFmpegPath")
         defaults.set(recordingFormat.rawValue, forKey: "recordingFormat")
         defaults.set(recordingDirectoryPath, forKey: "recordingDirectoryPath")
+        defaults.set(askRecordingLocationOnRecord, forKey: "askRecordingLocationOnRecord")
+        defaults.set(recordingCountdownEnabled, forKey: "recordingCountdownEnabled")
 
         for dest in destinations {
             defaults.set(dest.isEnabled, forKey: "dest_enabled_\(dest.platform.rawValue)")

@@ -7,11 +7,13 @@ public struct CompositorConfig: Sendable {
     public var mode: StreamSourceMode = .screenOnly
     public var pipPosition: PiPPosition = .bottomRight
     public var pipSize: PiPSize = .medium
+    public var pipShape: PiPShape = .rounded
     public var mirrorCamera: Bool = true
     public var width: Int = 1920
     public var height: Int = 1080
     public var fps: Int = 30
     public var isStreaming: Bool = false
+    public var isPreviewPaused: Bool = false
 
     public init() {}
 }
@@ -218,6 +220,11 @@ public final class FrameCompositor: @unchecked Sendable {
         }
         lock.unlock()
 
+        // Skip GPU rendering completely when window is minimized/hidden and neither streaming nor recording
+        if cfg.isPreviewPaused && !shouldEmitStreamFrame {
+            return
+        }
+
         let canvasWidth = cfg.width
         let canvasHeight = cfg.height
         let canvasRect = CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
@@ -256,14 +263,11 @@ public final class FrameCompositor: @unchecked Sendable {
                     canvasWidth: CGFloat(canvasWidth),
                     canvasHeight: CGFloat(canvasHeight),
                     position: cfg.pipPosition,
-                    size: cfg.pipSize
+                    size: cfg.pipSize,
+                    shape: cfg.pipShape
                 )
                 let pipImg = Self.aspectFillImage(camImg, into: pipRect)
-                let borderRect = pipRect.insetBy(dx: -3, dy: -3)
-                let borderImg = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.25))
-                    .cropped(to: borderRect)
-                composite = borderImg.composited(over: composite)
-                composite = pipImg.composited(over: composite)
+                composite = Self.compositePiP(pipImg, in: pipRect, shape: cfg.pipShape, over: composite)
             }
         }
 
@@ -338,10 +342,11 @@ public final class FrameCompositor: @unchecked Sendable {
         canvasWidth: CGFloat,
         canvasHeight: CGFloat,
         position: PiPPosition,
-        size: PiPSize
+        size: PiPSize,
+        shape: PiPShape
     ) -> CGRect {
         let width = (canvasWidth * size.widthFraction).rounded()
-        let height = (width * 9.0 / 16.0).rounded()
+        let height = shape == .circle ? width : (width * 9.0 / 16.0).rounded()
         let margin = (canvasWidth * 0.025).rounded()
 
         // CoreImage origin is bottom-left
@@ -362,5 +367,46 @@ public final class FrameCompositor: @unchecked Sendable {
             y = canvasHeight - height - margin
         }
         return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func compositePiP(_ pipImg: CIImage, in pipRect: CGRect, shape: PiPShape, over background: CIImage) -> CIImage {
+        let borderInset: CGFloat = -3
+        let borderRect = pipRect.insetBy(dx: borderInset, dy: borderInset)
+
+        switch shape {
+        case .rectangle:
+            let border = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.28)).cropped(to: borderRect)
+            return pipImg.composited(over: border.composited(over: background))
+
+        case .rounded, .circle:
+            let radius: CGFloat = (shape == .circle) ? (pipRect.width / 2.0) : min(22, pipRect.height * 0.14)
+            let borderRadius = radius + abs(borderInset)
+
+            guard let maskFilter = CIFilter(name: "CIRoundedRectangleGenerator"),
+                  let borderFilter = CIFilter(name: "CIRoundedRectangleGenerator"),
+                  let blendFilter = CIFilter(name: "CIBlendWithAlphaMask") else {
+                let border = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.28)).cropped(to: borderRect)
+                return pipImg.composited(over: border.composited(over: background))
+            }
+
+            borderFilter.setValue(CIVector(cgRect: borderRect), forKey: "inputExtent")
+            borderFilter.setValue(borderRadius, forKey: "inputRadius")
+            borderFilter.setValue(CIColor(red: 1, green: 1, blue: 1, alpha: 0.30), forKey: "inputColor")
+
+            let bgWithBorder = borderFilter.outputImage?.composited(over: background) ?? background
+
+            maskFilter.setValue(CIVector(cgRect: pipRect), forKey: "inputExtent")
+            maskFilter.setValue(radius, forKey: "inputRadius")
+            maskFilter.setValue(CIColor.white, forKey: "inputColor")
+
+            guard let maskImg = maskFilter.outputImage else {
+                return pipImg.composited(over: bgWithBorder)
+            }
+
+            blendFilter.setValue(pipImg, forKey: kCIInputImageKey)
+            blendFilter.setValue(bgWithBorder, forKey: kCIInputBackgroundImageKey)
+            blendFilter.setValue(maskImg, forKey: kCIInputMaskImageKey)
+            return blendFilter.outputImage ?? pipImg.composited(over: bgWithBorder)
+        }
     }
 }

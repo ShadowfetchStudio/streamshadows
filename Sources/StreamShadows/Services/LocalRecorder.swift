@@ -4,6 +4,7 @@ import Darwin
 public enum LocalRecorderError: LocalizedError, Sendable {
     case ffmpegNotFound
     case directoryCreationFailed(String)
+    case insufficientDiskSpace(String)
     case pipeCreationFailed(String)
     case processFailedToStart(String)
 
@@ -13,6 +14,8 @@ public enum LocalRecorderError: LocalizedError, Sendable {
             return "FFmpeg was not found. Install FFmpeg (e.g. `brew install ffmpeg`) or set its path in the Output tab."
         case .directoryCreationFailed(let msg):
             return "Could not create recordings folder: \(msg)"
+        case .insufficientDiskSpace(let msg):
+            return msg
         case .pipeCreationFailed(let msg):
             return "Failed to initialize recorder media pipes: \(msg)"
         case .processFailedToStart(let msg):
@@ -22,10 +25,11 @@ public enum LocalRecorderError: LocalizedError, Sendable {
 }
 
 /// Records the composited video and mixed stereo audio directly to local MP4, MKV, or MOV files.
-/// Works independently or simultaneously alongside live RTMP streaming.
+/// Features synchronized dual-FIFO gating, pause/resume, disk-space checks, and graceful EOF finalization.
 public final class LocalRecorder: @unchecked Sendable {
     public static let maxPendingVideoFrames = 3
     public static let maxPendingAudioFrames = 16
+    public static let minimumFreeDiskBytes: Int64 = 150 * 1024 * 1024 // 150 MB
 
     private let lock = NSLock()
     private var process: Process?
@@ -35,6 +39,8 @@ public final class LocalRecorder: @unchecked Sendable {
     private var videoFD: Int32 = -1
     private var audioFD: Int32 = -1
     private var isStopping = true
+    private var isPaused = false
+    private var lastErrorLine: String?
 
     private var pendingVideoFrames: Int = 0
     private var pendingAudioFrames: Int = 0
@@ -63,6 +69,18 @@ public final class LocalRecorder: @unchecked Sendable {
         return directory.appendingPathComponent("StreamShadows_\(stamp).\(format.fileExtension)")
     }
 
+    public static func availableDiskSpaceBytes(for directory: URL) -> Int64? {
+        let values = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage
+    }
+
+    public static func formatByteCount(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: max(0, bytes))
+    }
+
     public static func buildFFmpegArguments(
         videoPipePath: String,
         audioPipePath: String,
@@ -71,7 +89,6 @@ public final class LocalRecorder: @unchecked Sendable {
         format: RecordingFormat,
         outputPath: String
     ) -> [String] {
-        // Use a slightly higher bitrate for crisp local recordings
         let recordBitrateKbps = max(preset.videoBitrateKbps, preset.width >= 1920 ? 8000 : 5000)
 
         var args: [String] = [
@@ -116,7 +133,6 @@ public final class LocalRecorder: @unchecked Sendable {
             "-ac", "2"
         ])
 
-        // Crash-safe fragmented MP4/MOV so files remain playable even if interrupted
         if format == .mp4 || format == .mov {
             args.append(contentsOf: ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"])
         }
@@ -125,9 +141,15 @@ public final class LocalRecorder: @unchecked Sendable {
         return args
     }
 
+    public func setPaused(_ paused: Bool) {
+        lock.withLock {
+            self.isPaused = paused
+        }
+    }
+
     @discardableResult
     public func start(
-        directory: URL,
+        outputURL: URL,
         format: RecordingFormat,
         preset: VideoQualityPreset,
         encoder: VideoEncoderPreference,
@@ -137,13 +159,18 @@ public final class LocalRecorder: @unchecked Sendable {
             throw LocalRecorderError.ffmpegNotFound
         }
 
+        let parentDir = outputURL.deletingLastPathComponent()
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
         } catch {
             throw LocalRecorderError.directoryCreationFailed(error.localizedDescription)
         }
 
-        let outputURL = Self.makeRecordingURL(in: directory, format: format)
+        if let freeBytes = Self.availableDiskSpaceBytes(for: parentDir), freeBytes < Self.minimumFreeDiskBytes {
+            throw LocalRecorderError.insufficientDiskSpace(
+                "Not enough disk space to record (\(Self.formatByteCount(freeBytes)) available). Free up space or choose another drive."
+            )
+        }
 
         let sessionDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("streamshadows-rec-\(UUID().uuidString)", isDirectory: true)
@@ -176,15 +203,17 @@ public final class LocalRecorder: @unchecked Sendable {
         proc.standardError = stderrPipe
         proc.standardOutput = FileHandle.nullDevice
 
-        lock.lock()
-        self.process = proc
-        self.tempDirURL = sessionDir
-        self.currentOutputURL = outputURL
-        self.isStopping = false
-        self.pendingVideoFrames = 0
-        self.pendingAudioFrames = 0
-        self.droppedVideoFrames = 0
-        lock.unlock()
+        lock.withLock {
+            self.process = proc
+            self.tempDirURL = sessionDir
+            self.currentOutputURL = outputURL
+            self.isStopping = false
+            self.isPaused = false
+            self.lastErrorLine = nil
+            self.pendingVideoFrames = 0
+            self.pendingAudioFrames = 0
+            self.droppedVideoFrames = 0
+        }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -195,6 +224,9 @@ public final class LocalRecorder: @unchecked Sendable {
             for raw in lines {
                 let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !line.isEmpty {
+                    if RTMPStreamer.isMeaningfulErrorLine(line) {
+                        self?.lock.withLock { self?.lastErrorLine = line }
+                    }
                     self?.onLogLine?("[REC] \(line)")
                 }
             }
@@ -204,16 +236,40 @@ public final class LocalRecorder: @unchecked Sendable {
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             guard let self else { return }
             let code = terminatedProc.terminationStatus
-            let (wasStopping, savedURL): (Bool, URL?) = self.lock.withLock {
+            let (wasStopping, savedURL, detail): (Bool, URL?, String?) = self.lock.withLock {
                 let stopping = self.isStopping
                 self.isStopping = true
-                return (stopping, self.currentOutputURL)
+                return (stopping, self.currentOutputURL, self.lastErrorLine)
             }
             self.cleanupPipesAndTempDir()
-            let errorMessage: String? = (!wasStopping && code != 0)
-                ? "Recorder exited unexpectedly (code \(code))."
-                : nil
-            self.onFinished?(savedURL, code, errorMessage)
+
+            // Verify non-empty file; remove 0-byte stub if recording was stopped before frames were written
+            var finalURL = savedURL
+            var fileSize: Int64 = 0
+            if let url = savedURL,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attrs[.size] as? NSNumber {
+                fileSize = size.int64Value
+            }
+
+            var errorMessage: String?
+            if fileSize == 0 {
+                if let url = savedURL {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                finalURL = nil
+                if let detail, !detail.isEmpty {
+                    errorMessage = "Recording failed: \(detail)"
+                } else if !wasStopping && code != 0 {
+                    errorMessage = "Recorder exited unexpectedly (code \(code))."
+                } else {
+                    errorMessage = "Recording stopped before any video frames were written."
+                }
+            } else if !wasStopping && code != 0 {
+                errorMessage = detail.map { "Recording interrupted: \($0)" } ?? "Recorder exited unexpectedly (code \(code))."
+            }
+
+            self.onFinished?(finalURL, code, errorMessage)
         }
 
         do {
@@ -223,7 +279,7 @@ public final class LocalRecorder: @unchecked Sendable {
             throw LocalRecorderError.processFailedToStart(error.localizedDescription)
         }
 
-        onLogLine?("Recording started → \(outputURL.lastPathComponent)")
+        onLogLine?("Recording started → \(outputURL.path)")
 
         let vPath = videoPipeURL.path
         let aPath = audioPipeURL.path
@@ -273,8 +329,9 @@ public final class LocalRecorder: @unchecked Sendable {
 
     public func writeVideoFrame(_ buffer: PooledFrameBuffer) {
         let shouldWrite: Bool = lock.withLock {
-            if isStopping || pendingVideoFrames >= Self.maxPendingVideoFrames {
-                if !isStopping {
+            let bothPipesReady = (videoFD >= 0 && audioFD >= 0)
+            if isStopping || isPaused || !bothPipesReady || pendingVideoFrames >= Self.maxPendingVideoFrames {
+                if !isStopping && !isPaused && bothPipesReady {
                     droppedVideoFrames += 1
                 }
                 return false
@@ -296,15 +353,18 @@ public final class LocalRecorder: @unchecked Sendable {
                 buffer.recycle()
             }
             guard let self else { return }
-            let (fd, stopping) = self.lock.withLock { (self.videoFD, self.isStopping) }
-            guard fd >= 0, !stopping else { return }
+            let (fd, ready, stopping) = self.lock.withLock {
+                (self.videoFD, self.videoFD >= 0 && self.audioFD >= 0, self.isStopping)
+            }
+            guard ready, fd >= 0, !stopping else { return }
             Self.writeAll(fd: fd, base: buffer.pointer, count: buffer.byteCount)
         }
     }
 
     public func writeAudioFrame(_ data: Data) {
         let shouldWrite: Bool = lock.withLock {
-            if isStopping || pendingAudioFrames >= Self.maxPendingAudioFrames {
+            let bothPipesReady = (videoFD >= 0 && audioFD >= 0)
+            if isStopping || isPaused || !bothPipesReady || pendingAudioFrames >= Self.maxPendingAudioFrames {
                 return false
             }
             pendingAudioFrames += 1
@@ -319,8 +379,10 @@ public final class LocalRecorder: @unchecked Sendable {
                 }
             }
             guard let self else { return }
-            let (fd, stopping) = self.lock.withLock { (self.audioFD, self.isStopping) }
-            guard fd >= 0, !stopping else { return }
+            let (fd, ready, stopping) = self.lock.withLock {
+                (self.audioFD, self.videoFD >= 0 && self.audioFD >= 0, self.isStopping)
+            }
+            guard ready, fd >= 0, !stopping else { return }
             data.withUnsafeBytes { rawBuffer in
                 guard let base = rawBuffer.baseAddress else { return }
                 Self.writeAll(fd: fd, base: base, count: rawBuffer.count)
@@ -332,6 +394,7 @@ public final class LocalRecorder: @unchecked Sendable {
     public func stop() {
         let (proc, vfd, afd): (Process?, Int32, Int32) = lock.withLock {
             isStopping = true
+            isPaused = false
             let p = process
             let v = videoFD
             let a = audioFD
@@ -340,7 +403,6 @@ public final class LocalRecorder: @unchecked Sendable {
             return (p, v, a)
         }
 
-        // Closing both write FDs triggers clean EOF in FFmpeg so MP4/MKV/MOV metadata flushes cleanly
         if vfd >= 0 { Darwin.close(vfd) }
         if afd >= 0 { Darwin.close(afd) }
 
@@ -357,6 +419,20 @@ public final class LocalRecorder: @unchecked Sendable {
             }
         } else {
             cleanupPipesAndTempDir()
+        }
+    }
+
+    /// Synchronously stops and waits up to `timeout` seconds for FFmpeg to flush and finalize the file (used on app quit).
+    public func stopAndWait(timeout: TimeInterval = 3.0) {
+        let proc = lock.withLock { process }
+        stop()
+        guard let proc else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning && Date() < deadline {
+            usleep(25_000)
+        }
+        if proc.isRunning {
+            proc.terminate()
         }
     }
 

@@ -33,6 +33,20 @@ public enum StreamSourceMode: String, CaseIterable, Identifiable, Codable, Senda
     }
 }
 
+public enum ScreenCaptureTargetMode: String, CaseIterable, Identifiable, Codable, Sendable {
+    case display = "display"
+    case window = "window"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .display: return "Full Screen"
+        case .window: return "Single Window"
+        }
+    }
+}
+
 public enum PiPPosition: String, CaseIterable, Identifiable, Codable, Sendable {
     case topLeft = "top_left"
     case topRight = "top_right"
@@ -71,6 +85,22 @@ public enum PiPSize: String, CaseIterable, Identifiable, Codable, Sendable {
         case .small: return 0.18
         case .medium: return 0.25
         case .large: return 0.33
+        }
+    }
+}
+
+public enum PiPShape: String, CaseIterable, Identifiable, Codable, Sendable {
+    case rounded = "rounded"
+    case circle = "circle"
+    case rectangle = "rectangle"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .rounded: return "Rounded"
+        case .circle: return "Circle"
+        case .rectangle: return "Sharp"
         }
     }
 }
@@ -245,6 +275,21 @@ public struct DisplayOption: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct WindowOption: Identifiable, Hashable, Sendable {
+    public let id: CGWindowID
+    public let appName: String
+    public let title: String
+    public let width: Int
+    public let height: Int
+
+    public var displayLabel: String {
+        if title.isEmpty || title == appName {
+            return appName
+        }
+        return "\(appName) — \(title)"
+    }
+}
+
 public struct CaptureDeviceOption: Identifiable, Hashable, Sendable {
     public let id: String
     public let name: String
@@ -274,6 +319,7 @@ public enum StreamState: Equatable, Sendable {
     case idle
     case starting
     case live(startedAt: Date)
+    case reconnecting(attempt: Int, maxAttempts: Int)
     case stopping
     case error(String)
 
@@ -284,7 +330,7 @@ public enum StreamState: Equatable, Sendable {
 
     public var isActive: Bool {
         switch self {
-        case .starting, .live, .stopping:
+        case .starting, .live, .reconnecting, .stopping:
             return true
         case .idle, .error:
             return false
@@ -312,7 +358,9 @@ public enum RecordingFormat: String, CaseIterable, Identifiable, Codable, Sendab
 
 public enum RecordingState: Equatable, Sendable {
     case idle
+    case countdown(remaining: Int, fileURL: URL)
     case recording(startedAt: Date, fileURL: URL)
+    case paused(accumulated: TimeInterval, fileURL: URL)
     case stopping
     case error(String)
 
@@ -321,9 +369,19 @@ public enum RecordingState: Equatable, Sendable {
         return false
     }
 
+    public var isPaused: Bool {
+        if case .paused = self { return true }
+        return false
+    }
+
+    public var isCountdown: Bool {
+        if case .countdown = self { return true }
+        return false
+    }
+
     public var isActive: Bool {
         switch self {
-        case .recording, .stopping:
+        case .countdown, .recording, .paused, .stopping:
             return true
         case .idle, .error:
             return false

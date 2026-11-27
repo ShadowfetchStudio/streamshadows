@@ -34,6 +34,7 @@ public final class RTMPStreamer: @unchecked Sendable {
     private var audioFD: Int32 = -1
     private var isStopping = true
     private var secretsToRedact: [String] = []
+    private var lastErrorLine: String?
 
     private var pendingVideoFrames: Int = 0
     private var pendingAudioFrames: Int = 0
@@ -229,6 +230,7 @@ public final class RTMPStreamer: @unchecked Sendable {
         self.tempDirURL = sessionDir
         self.isStopping = false
         self.secretsToRedact = secrets
+        self.lastErrorLine = nil
         self.pendingVideoFrames = 0
         self.pendingAudioFrames = 0
         self.droppedVideoFrames = 0
@@ -244,16 +246,23 @@ public final class RTMPStreamer: @unchecked Sendable {
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             guard let self else { return }
             let code = terminatedProc.terminationStatus
-            let wasStopping: Bool
-            self.lock.lock()
-            wasStopping = self.isStopping
-            self.isStopping = true
-            self.lock.unlock()
+            let (wasStopping, detail): (Bool, String?) = self.lock.withLock {
+                let stopping = self.isStopping
+                self.isStopping = true
+                return (stopping, self.lastErrorLine)
+            }
 
             self.cleanupPipesAndTempDir()
-            let message: String? = (!wasStopping && code != 0)
-                ? "Stream encoder exited unexpectedly (code \(code)). Check your stream key, ingest URL, and internet connection."
-                : nil
+            let message: String?
+            if !wasStopping && code != 0 {
+                if let detail, !detail.isEmpty {
+                    message = "Stream failed: \(detail)"
+                } else {
+                    message = "Stream encoder exited unexpectedly (code \(code)). Check your stream key, ingest URL, and internet connection."
+                }
+            } else {
+                message = nil
+            }
             self.onTerminated?(code, message)
         }
 
@@ -320,12 +329,13 @@ public final class RTMPStreamer: @unchecked Sendable {
         }
     }
 
-    /// Writes a pooled BGRA video frame with backpressure dropping if the FIFO lags.
+    /// Writes a pooled BGRA video frame with backpressure dropping and synchronized dual-FIFO gating.
     public func writeVideoFrame(_ buffer: PooledFrameBuffer) {
         lock.lock()
         let stopping = isStopping
-        if stopping || pendingVideoFrames >= Self.maxPendingVideoFrames {
-            if !stopping {
+        let bothPipesReady = (videoFD >= 0 && audioFD >= 0)
+        if stopping || !bothPipesReady || pendingVideoFrames >= Self.maxPendingVideoFrames {
+            if !stopping && bothPipesReady {
                 droppedVideoFrames += 1
             }
             lock.unlock()
@@ -347,18 +357,20 @@ public final class RTMPStreamer: @unchecked Sendable {
             guard let self else { return }
             self.lock.lock()
             let fd = self.videoFD
+            let ready = (self.videoFD >= 0 && self.audioFD >= 0)
             let stopping = self.isStopping
             self.lock.unlock()
-            guard fd >= 0, !stopping else { return }
+            guard ready, fd >= 0, !stopping else { return }
             Self.writeAll(fd: fd, base: buffer.pointer, count: buffer.byteCount)
         }
     }
 
-    /// Writes mixed s16le stereo PCM audio with bounded queue backpressure.
+    /// Writes mixed s16le stereo PCM audio with bounded queue backpressure and dual-FIFO gating.
     public func writeAudioFrame(_ data: Data) {
         lock.lock()
         let stopping = isStopping
-        if stopping || pendingAudioFrames >= Self.maxPendingAudioFrames {
+        let bothPipesReady = (videoFD >= 0 && audioFD >= 0)
+        if stopping || !bothPipesReady || pendingAudioFrames >= Self.maxPendingAudioFrames {
             lock.unlock()
             return
         }
@@ -376,9 +388,10 @@ public final class RTMPStreamer: @unchecked Sendable {
             guard let self else { return }
             self.lock.lock()
             let fd = self.audioFD
+            let ready = (self.videoFD >= 0 && self.audioFD >= 0)
             let stopping = self.isStopping
             self.lock.unlock()
-            guard fd >= 0, !stopping else { return }
+            guard ready, fd >= 0, !stopping else { return }
             data.withUnsafeBytes { rawBuffer in
                 guard let base = rawBuffer.baseAddress else { return }
                 Self.writeAll(fd: fd, base: base, count: rawBuffer.count)
@@ -465,9 +478,24 @@ public final class RTMPStreamer: @unchecked Sendable {
                     onTelemetry?(telemetry)
                 }
             } else {
+                if Self.isMeaningfulErrorLine(line) {
+                    lock.lock()
+                    lastErrorLine = line
+                    lock.unlock()
+                }
                 onLogLine?(line)
             }
         }
+    }
+
+    public static func isMeaningfulErrorLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        let keywords = [
+            "error", "failed", "refused", "forbidden", "unauthorized",
+            "invalid", "broken pipe", "timed out", "could not", "no such",
+            "no space", "handshake", "rejected", "unrecognized", "permission denied"
+        ]
+        return keywords.contains { lower.contains($0) }
     }
 
     public static func parseProgressLine(_ line: String) -> StreamTelemetry? {
