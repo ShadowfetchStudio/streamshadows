@@ -161,14 +161,35 @@ struct ContentView: View {
                 }
             }
 
-            // Corner mode badge
+            // Corner mode badge & quick screen switcher
             VStack {
-                HStack {
+                HStack(spacing: 8) {
                     Label(viewModel.sourceMode.title, systemImage: viewModel.sourceMode.symbolName)
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(.ultraThinMaterial, in: Capsule())
+
+                    if viewModel.sourceMode.usesScreen && !viewModel.displays.isEmpty {
+                        Picker("Screen", selection: Binding(
+                            get: { viewModel.selectedDisplayID ?? viewModel.displays.first?.id ?? 0 },
+                            set: { viewModel.selectDisplay($0) }
+                        )) {
+                            ForEach(viewModel.displays) { display in
+                                Text("\(display.name) (\(display.resolutionLabel))")
+                                    .tag(display.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(maxWidth: 260)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .help("Choose which screen to capture")
+                    }
+
                     Spacer()
                     Text("\(viewModel.qualityPreset.width)×\(viewModel.qualityPreset.height) • \(viewModel.qualityPreset.fps)fps")
                         .font(.caption2.monospacedDigit())

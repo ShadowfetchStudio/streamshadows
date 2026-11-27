@@ -4,14 +4,22 @@ import ScreenCaptureKit
 import CoreMedia
 import CoreVideo
 import CoreGraphics
+import AppKit
 
 /// Coordinates macOS ScreenCaptureKit (display video + system audio) and AVFoundation (camera + microphone).
 public final class CaptureManager: NSObject, @unchecked Sendable {
     private var scStream: SCStream?
     private var availableDisplays: [SCDisplay] = []
+    private var activeDisplayID: CGDirectDisplayID?
+    private var activeDisplayWidth: Int = 0
+    private var activeDisplayHeight: Int = 0
+    private var activeDisplayFPS: Int = 0
+    private var activeDisplayAudio: Bool = false
 
     private var cameraSession: AVCaptureSession?
+    private var activeCameraID: String?
     private var micSession: AVCaptureSession?
+    private var activeMicID: String?
 
     private let screenVideoQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.screen.video", qos: .userInteractive)
     private let screenAudioQueue = DispatchQueue(label: "com.shadowfetch.streamshadows.screen.audio", qos: .userInteractive)
@@ -53,19 +61,57 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
     // MARK: - Device Discovery
 
-    public func refreshDisplays() async throws -> [DisplayOption] {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        self.availableDisplays = content.displays
-
-        return content.displays.enumerated().map { idx, display in
-            let isMain = CGDisplayIsMain(display.displayID) != 0
-            let name = isMain ? "Main Display (\(idx + 1))" : "Display \(idx + 1)"
+    /// Lists all connected physical displays immediately via NSScreen (does not require Screen Recording permission).
+    @MainActor
+    public static func listConnectedDisplays() -> [DisplayOption] {
+        NSScreen.screens.enumerated().compactMap { idx, screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+            let displayID = CGDirectDisplayID(number.uint32Value)
+            let isMain = CGDisplayIsMain(displayID) != 0
+            let rawName = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let baseName = rawName.isEmpty ? "Display \(idx + 1)" : rawName
+            let label = isMain ? "\(baseName) (Main)" : baseName
+            let scale = screen.backingScaleFactor
+            let pixelWidth = Int((screen.frame.width * scale).rounded())
+            let pixelHeight = Int((screen.frame.height * scale).rounded())
             return DisplayOption(
-                id: display.displayID,
-                name: name,
-                width: display.width,
-                height: display.height
+                id: displayID,
+                name: label,
+                width: pixelWidth,
+                height: pixelHeight
             )
+        }
+    }
+
+    public func refreshDisplays() async throws -> [DisplayOption] {
+        let screenDisplays = await MainActor.run { Self.listConnectedDisplays() }
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            self.availableDisplays = content.displays
+
+            if !screenDisplays.isEmpty {
+                return screenDisplays
+            }
+
+            return content.displays.enumerated().map { idx, display in
+                let isMain = CGDisplayIsMain(display.displayID) != 0
+                let name = isMain ? "Main Display (\(idx + 1))" : "Display \(idx + 1)"
+                return DisplayOption(
+                    id: display.displayID,
+                    name: name,
+                    width: display.width,
+                    height: display.height
+                )
+            }
+        } catch {
+            // Still return physical displays from NSScreen so the user can always see and select screens
+            if !screenDisplays.isEmpty {
+                return screenDisplays
+            }
+            throw error
         }
     }
 
@@ -99,10 +145,20 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     // MARK: - Screen Capture
 
     public func startScreenCapture(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, captureSystemAudio: Bool) async throws {
+        if scStream != nil,
+           activeDisplayID == displayID,
+           activeDisplayWidth == width,
+           activeDisplayHeight == height,
+           activeDisplayFPS == fps,
+           activeDisplayAudio == captureSystemAudio {
+            return
+        }
+
         await stopScreenCapture()
 
-        if availableDisplays.isEmpty {
-            _ = try await refreshDisplays()
+        if availableDisplays.isEmpty || !availableDisplays.contains(where: { $0.displayID == displayID }) {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            self.availableDisplays = content.displays
         }
 
         guard let targetDisplay = availableDisplays.first(where: { $0.displayID == displayID }) ?? availableDisplays.first else {
@@ -131,9 +187,15 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
 
         try await stream.startCapture()
         self.scStream = stream
+        self.activeDisplayID = targetDisplay.displayID
+        self.activeDisplayWidth = width
+        self.activeDisplayHeight = height
+        self.activeDisplayFPS = fps
+        self.activeDisplayAudio = captureSystemAudio
     }
 
     public func stopScreenCapture() async {
+        activeDisplayID = nil
         if let stream = scStream {
             scStream = nil
             try? await stream.stopCapture()
@@ -143,6 +205,9 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     // MARK: - Camera Capture
 
     public func startCameraCapture(deviceID: String) throws {
+        if cameraSession != nil, activeCameraID == deviceID {
+            return
+        }
         stopCameraCapture()
 
         guard let device = AVCaptureDevice(uniqueID: deviceID) else {
@@ -181,12 +246,14 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         session.commitConfiguration()
 
         self.cameraSession = session
+        self.activeCameraID = deviceID
         cameraQueue.async {
             session.startRunning()
         }
     }
 
     public func stopCameraCapture() {
+        activeCameraID = nil
         if let session = cameraSession {
             cameraSession = nil
             cameraQueue.async {
@@ -200,6 +267,9 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
     // MARK: - Microphone Capture
 
     public func startMicrophoneCapture(deviceID: String) throws {
+        if micSession != nil, activeMicID == deviceID {
+            return
+        }
         stopMicrophoneCapture()
 
         guard let device = AVCaptureDevice(uniqueID: deviceID) else {
@@ -231,12 +301,14 @@ public final class CaptureManager: NSObject, @unchecked Sendable {
         session.commitConfiguration()
 
         self.micSession = session
+        self.activeMicID = deviceID
         micQueue.async {
             session.startRunning()
         }
     }
 
     public func stopMicrophoneCapture() {
+        activeMicID = nil
         if let session = micSession {
             micSession = nil
             micQueue.async {

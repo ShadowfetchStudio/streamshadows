@@ -139,6 +139,11 @@ public final class StreamViewModel: ObservableObject {
 
     private var uptimeTimer: Timer?
     private var isBootstrapped = false
+    private var isRequestingMicPermission = false
+    private var hasAutoPromptedMic = false
+    private var isRequestingCameraPermission = false
+    private var hasAutoPromptedCamera = false
+    private var screenParamsObserver: NSObjectProtocol?
 
     public init() {
         loadPreferences()
@@ -162,6 +167,22 @@ public final class StreamViewModel: ObservableObject {
         guard !isBootstrapped else { return }
         isBootstrapped = true
 
+        // Populate connected screens synchronously via NSScreen so they appear immediately
+        displays = CaptureManager.listConnectedDisplays()
+        if selectedDisplayID == nil || !displays.contains(where: { $0.id == selectedDisplayID }) {
+            selectedDisplayID = displays.first?.id
+        }
+
+        screenParamsObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshAllDevices()
+            }
+        }
+
         refreshPermissionStatus()
         await refreshAllDevices()
 
@@ -174,6 +195,10 @@ public final class StreamViewModel: ObservableObject {
     }
 
     public func shutdown() {
+        if let observer = screenParamsObserver {
+            NotificationCenter.default.removeObserver(observer)
+            screenParamsObserver = nil
+        }
         uptimeTimer?.invalidate()
         uptimeTimer = nil
         streamer.stop()
@@ -203,7 +228,11 @@ public final class StreamViewModel: ObservableObject {
     }
 
     public func requestCameraPermission() {
+        guard !isRequestingCameraPermission else { return }
+        isRequestingCameraPermission = true
+        hasAutoPromptedCamera = true
         Task {
+            defer { isRequestingCameraPermission = false }
             let granted = await CaptureManager.requestCameraAccess()
             hasCameraPermission = granted
             if granted {
@@ -215,7 +244,11 @@ public final class StreamViewModel: ObservableObject {
     }
 
     public func requestMicPermission() {
+        guard !isRequestingMicPermission else { return }
+        isRequestingMicPermission = true
+        hasAutoPromptedMic = true
         Task {
+            defer { isRequestingMicPermission = false }
             let granted = await CaptureManager.requestMicrophoneAccess()
             hasMicPermission = granted
             if granted {
@@ -244,29 +277,43 @@ public final class StreamViewModel: ObservableObject {
             selectedMicID = microphones.first?.id
         }
 
+        // Always update displays via NSScreen first
+        let physicalDisplays = CaptureManager.listConnectedDisplays()
+        if !physicalDisplays.isEmpty {
+            displays = physicalDisplays
+            if selectedDisplayID == nil || !physicalDisplays.contains(where: { $0.id == selectedDisplayID }) {
+                selectedDisplayID = physicalDisplays.first?.id
+            }
+        }
+
         do {
             let foundDisplays = try await captureManager.refreshDisplays()
-            displays = foundDisplays
-            if selectedDisplayID == nil || !foundDisplays.contains(where: { $0.id == selectedDisplayID }) {
-                selectedDisplayID = foundDisplays.first?.id
+            if !foundDisplays.isEmpty {
+                displays = foundDisplays
+                if selectedDisplayID == nil || !foundDisplays.contains(where: { $0.id == selectedDisplayID }) {
+                    selectedDisplayID = foundDisplays.first?.id
+                }
             }
-            hasScreenPermission = true
+            hasScreenPermission = CaptureManager.hasScreenCapturePermission()
         } catch {
             appendLog("Display refresh notice: \(error.localizedDescription)")
         }
     }
 
     public func selectDisplay(_ id: CGDirectDisplayID?) {
+        guard selectedDisplayID != id else { return }
         selectedDisplayID = id
         Task { await reconfigureScreenCapture() }
     }
 
     public func selectCamera(_ id: String?) {
+        guard selectedCameraID != id else { return }
         selectedCameraID = id
         reconfigureCameraCapture()
     }
 
     public func selectMicrophone(_ id: String?) {
+        guard selectedMicID != id else { return }
         selectedMicID = id
         reconfigureMicCapture()
     }
@@ -290,6 +337,7 @@ public final class StreamViewModel: ObservableObject {
                     fps: qualityPreset.fps,
                     captureSystemAudio: systemAudioEnabled
                 )
+                hasScreenPermission = true
                 statusBanner = nil
             } catch {
                 appendLog("Screen capture error: \(error.localizedDescription)")
@@ -305,7 +353,9 @@ public final class StreamViewModel: ObservableObject {
         if sourceMode.usesCamera, let camID = selectedCameraID {
             let status = CaptureManager.cameraAuthorizationStatus()
             if status == .notDetermined {
-                requestCameraPermission()
+                if !hasAutoPromptedCamera {
+                    requestCameraPermission()
+                }
                 return
             }
             guard status == .authorized else {
@@ -327,7 +377,9 @@ public final class StreamViewModel: ObservableObject {
         if micAudioEnabled, let micID = selectedMicID {
             let status = CaptureManager.microphoneAuthorizationStatus()
             if status == .notDetermined {
-                requestMicPermission()
+                if !hasAutoPromptedMic {
+                    requestMicPermission()
+                }
                 return
             }
             guard status == .authorized else { return }

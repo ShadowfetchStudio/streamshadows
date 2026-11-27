@@ -66,7 +66,7 @@ struct InspectorSidebar: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Label("Display", systemImage: "display")
+                            Label("Select Screen (\(viewModel.displays.count))", systemImage: "display.2")
                                 .font(.subheadline.weight(.semibold))
                             Spacer()
                             Button {
@@ -79,25 +79,54 @@ struct InspectorSidebar: View {
                         }
 
                         if viewModel.displays.isEmpty {
-                            Text("No displays detected yet.")
+                            Text("No displays detected.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                        } else {
+                            VStack(spacing: 6) {
+                                ForEach(viewModel.displays) { display in
+                                    let isSelected = display.id == viewModel.selectedDisplayID
+                                    Button {
+                                        viewModel.selectDisplay(display.id)
+                                    } label: {
+                                        HStack(spacing: 10) {
+                                            Image(systemName: "display")
+                                                .font(.body)
+                                                .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(display.name)
+                                                    .font(.callout.weight(isSelected ? .semibold : .regular))
+                                                    .foregroundStyle(isSelected ? .white : .primary)
+                                                    .lineLimit(1)
+                                                Text(display.resolutionLabel)
+                                                    .font(.caption2.monospacedDigit())
+                                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
+                                            }
+                                            Spacer()
+                                            if isSelected {
+                                                Image(systemName: "checkmark.circle.fill")
+                                                    .foregroundStyle(.white)
+                                            }
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 8)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(isSelected ? Color.purple : Color.white.opacity(0.06))
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+
+                        if !viewModel.hasScreenPermission {
                             Button("Grant Screen Recording Access") {
                                 viewModel.requestScreenPermission()
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
-                        } else {
-                            Picker("Select Display", selection: Binding(
-                                get: { viewModel.selectedDisplayID ?? viewModel.displays.first?.id ?? 0 },
-                                set: { viewModel.selectDisplay($0) }
-                            )) {
-                                ForEach(viewModel.displays) { display in
-                                    Text("\(display.name) (\(display.resolutionLabel))")
-                                        .tag(display.id)
-                                }
-                            }
-                            .labelsHidden()
                         }
                     }
                     .padding(4)
