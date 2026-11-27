@@ -64,7 +64,37 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
 </dict>
 EOF
 
-# Ad-hoc sign the bundle so macOS TCC permissions (Screen Recording, Camera, Microphone) persist cleanly
-codesign --force --deep --sign - "$APP_BUNDLE"
+ENTITLEMENTS_FILE="$DIST_DIR/StreamShadows.entitlements"
+cat > "$ENTITLEMENTS_FILE" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+# Prefer a real Apple Development signing identity so macOS TCC (Screen Recording, Mic, Camera)
+# binds permissions stably to com.shadowfetch.streamshadows instead of invalidating on rebuild.
+SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/{print $2; exit}' || true)"
+fi
+
+if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "Signing with identity: $SIGN_IDENTITY"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS_FILE" --identifier "com.shadowfetch.streamshadows" --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+else
+    echo "No Apple Development certificate found; falling back to ad-hoc signing."
+    codesign --force --entitlements "$ENTITLEMENTS_FILE" --identifier "com.shadowfetch.streamshadows" --sign - "$APP_BUNDLE"
+fi
+
+rm -f "$ENTITLEMENTS_FILE"
 
 echo "Built $APP_BUNDLE successfully."

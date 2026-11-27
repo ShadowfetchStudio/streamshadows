@@ -144,6 +144,7 @@ public final class StreamViewModel: ObservableObject {
     private var isRequestingCameraPermission = false
     private var hasAutoPromptedCamera = false
     private var screenParamsObserver: NSObjectProtocol?
+    private var appActiveObserver: NSObjectProtocol?
 
     public init() {
         loadPreferences()
@@ -183,6 +184,22 @@ public final class StreamViewModel: ObservableObject {
             }
         }
 
+        appActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let hadScreen = self.hasScreenPermission
+                self.refreshPermissionStatus()
+                if !hadScreen && self.hasScreenPermission {
+                    await self.refreshAllDevices()
+                    await self.reconfigureScreenCapture()
+                }
+            }
+        }
+
         refreshPermissionStatus()
         await refreshAllDevices()
 
@@ -198,6 +215,10 @@ public final class StreamViewModel: ObservableObject {
         if let observer = screenParamsObserver {
             NotificationCenter.default.removeObserver(observer)
             screenParamsObserver = nil
+        }
+        if let observer = appActiveObserver {
+            NotificationCenter.default.removeObserver(observer)
+            appActiveObserver = nil
         }
         uptimeTimer?.invalidate()
         uptimeTimer = nil
@@ -218,8 +239,12 @@ public final class StreamViewModel: ObservableObject {
     }
 
     public func requestScreenPermission() {
-        CaptureManager.requestScreenCapturePermission()
+        let granted = CaptureManager.requestScreenCapturePermission()
         refreshPermissionStatus()
+        if !granted && !hasScreenPermission {
+            openSystemSettingsPrivacy("Privacy_ScreenCapture")
+            statusBanner = "Enable StreamShadows in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen StreamShadows."
+        }
         Task {
             try? await Task.sleep(for: .milliseconds(500))
             await refreshAllDevices()
